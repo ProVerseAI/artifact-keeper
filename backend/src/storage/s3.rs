@@ -21,6 +21,12 @@
 //! - S3_POOL_MAX_IDLE_PER_HOST: Maximum idle connections per host (default: 256)
 //! - S3_POOL_IDLE_TIMEOUT_SECS: Idle connection timeout in seconds (default: 90)
 //!
+//! For multipart upload tuning (see [`S3Config`] and `adaptive_part_size_with`):
+//! - S3_MULTIPART_CHUNK_SIZE: Part size in bytes (default: 5 MiB)
+//! - S3_MULTIPART_MAX_IN_FLIGHT_PARTS: Max concurrent part uploads (default: 4)
+//! - S3_MULTIPART_TARGET_PARTS: Target part count for a known-length object
+//!   (default: 9000, comfortably under S3's 10,000-part cap)
+//!
 //! For HTTP request timeouts:
 //! - S3_BULK_TIMEOUT_SECS: Overall request timeout for bulk data transfer --
 //!   object payload reads/writes, multipart part uploads, and server-side
@@ -31,6 +37,7 @@
 //!   CopyObject (default: 5 GiB, AWS's cap). Larger sources are copied via
 //!   multipart UploadPartCopy in slices of this size. Clamped into
 //!   [5 MiB, 5 GiB]. Lever for S3-compatible stores with lower copy limits.
+//!   `S3_MAX_SINGLE_COPY_SIZE` is honoured as a fallback alias.
 //!
 //! For redirect downloads (302 to presigned URLs):
 //! - S3_REDIRECT_DOWNLOADS: Enable 302 redirects (default: false)
@@ -66,10 +73,14 @@ use crate::error::{AppError, Result};
 /// at least this large. This is also the part size used for the first
 /// [`S3_PARTS_PER_TIER`] parts of an unknown-length stream, so the behaviour for
 /// small/typical artifacts is identical to the historical fixed-size path.
+///
+/// Default for the `S3_MULTIPART_CHUNK_SIZE` env var (see [`S3Config`]).
 const S3_MULTIPART_CHUNK_SIZE: usize = 5 * 1024 * 1024;
 /// S3's maximum multipart part size (5 GiB). No single `UploadPart` may exceed
-/// this regardless of how large the object is.
+/// this regardless of how large the object is. This is a hard S3 API limit,
+/// not configurable.
 const S3_MULTIPART_MAX_PART_SIZE: u64 = 5 * 1024 * 1024 * 1024;
+/// Default for the `S3_MULTIPART_MAX_IN_FLIGHT_PARTS` env var (see [`S3Config`]).
 const S3_MULTIPART_MAX_IN_FLIGHT_PARTS: usize = 4;
 /// AWS's ceiling for a single copy operation (5 GiB): "You create a copy of
 /// your object up to 5 GB in size in a single atomic action using this API.
@@ -104,23 +115,29 @@ const S3_MAX_OBJECT_SIZE: u64 = 5 * 1024 * 1024 * 1024 * 1024;
 /// When the object size is known up front we target this many parts (comfortably
 /// under the 10,000-part cap) so transient retries / off-by-one buffering never
 /// push us over the hard limit.
+///
+/// Default for the `S3_MULTIPART_TARGET_PARTS` env var (see [`S3Config`]).
 const S3_MULTIPART_TARGET_PARTS: u64 = 9_000;
 /// Number of parts uploaded at each size tier before the part size doubles, used
 /// when the object length is unknown (pure streaming). With 1,000 parts per tier
 /// the size doubles 5 MiB → 10 MiB → … → 5 GiB across the first 10 tiers, so the
 /// full 10,000-part budget covers objects up to ~4.99 TiB (see
-/// [`adaptive_part_size`]).
+/// [`adaptive_part_size_with`]).
 const S3_PARTS_PER_TIER: u32 = 1_000;
 
 /// Compute the S3 multipart part size (in bytes) to use for the part at
 /// `part_index` (0-based), given the total object size when it is known.
 ///
 /// This is the single source of truth for adaptive part sizing and is pure so it
-/// can be unit-tested exhaustively without a live S3.
+/// can be unit-tested exhaustively without a live S3. `min_part` and
+/// `target_parts` are explicit parameters (rather than always using
+/// [`S3_MULTIPART_CHUNK_SIZE`] / [`S3_MULTIPART_TARGET_PARTS`]) so callers can
+/// honour the `S3_MULTIPART_CHUNK_SIZE` / `S3_MULTIPART_TARGET_PARTS` env-var
+/// overrides (see [`S3Config`]).
 ///
 /// # Known size (`object_size = Some(n)`)
 /// We pick one fixed part size for the whole object:
-/// `clamp(ceil(n / TARGET_PARTS), MIN_PART, MAX_PART)`. Targeting
+/// `clamp(ceil(n / target_parts), min_part, MAX_PART)`. Targeting
 /// [`S3_MULTIPART_TARGET_PARTS`] (9,000) parts keeps us under the 10,000-part cap
 /// with margin. Capped at [`S3_MULTIPART_MAX_PART_SIZE`] (5 GiB), one part size
 /// reaches S3's 5 TiB object ceiling (5 GiB × 1,000 parts).
@@ -128,18 +145,30 @@ const S3_PARTS_PER_TIER: u32 = 1_000;
 /// # Unknown size (`object_size = None`, pure streaming)
 /// We grow the part size as the part index climbs so the 10,000-part budget can
 /// cover a large object without knowing its length in advance. The size doubles
-/// every [`S3_PARTS_PER_TIER`] parts starting from [`S3_MULTIPART_CHUNK_SIZE`]
-/// (5 MiB) and is capped at [`S3_MULTIPART_MAX_PART_SIZE`] (5 GiB):
-/// `min(MAX_PART, MIN_PART << (part_index / PARTS_PER_TIER))`.
-/// The first 1,000 parts stay at 5 MiB, so small/typical objects are unaffected.
-/// Summed across all 10,000 parts this schedule covers ~4.99 TiB.
-fn adaptive_part_size(object_size: Option<u64>, part_index: u32) -> u64 {
-    const MIN_PART: u64 = S3_MULTIPART_CHUNK_SIZE as u64;
+/// every [`S3_PARTS_PER_TIER`] parts starting from `min_part` and is capped at
+/// [`S3_MULTIPART_MAX_PART_SIZE`] (5 GiB):
+/// `min(MAX_PART, min_part << (part_index / PARTS_PER_TIER))`.
+/// The first 1,000 parts stay at `min_part`, so small/typical objects are
+/// unaffected. Summed across all 10,000 parts this schedule covers ~4.99 TiB
+/// (using the default 5 MiB `min_part`).
+///
+/// Note the returned part size still climbs with `part_index` for an
+/// unknown-length stream — at high tiers (approaching the 5 GiB
+/// `S3_MULTIPART_MAX_PART_SIZE` cap) a caller that buffers several parts
+/// concurrently (e.g. the bounded-concurrency multipart upload/copy loops)
+/// must keep `in_flight_parts * part_size` within its own memory budget; see
+/// the in-flight-parts bound in `put_stream`.
+fn adaptive_part_size_with(
+    min_part: u64,
+    target_parts: u64,
+    object_size: Option<u64>,
+    part_index: u32,
+) -> u64 {
     match object_size {
         Some(size) => {
             // ceil(size / TARGET_PARTS), then clamp into [MIN_PART, MAX_PART].
-            let target = size.div_ceil(S3_MULTIPART_TARGET_PARTS);
-            target.clamp(MIN_PART, S3_MULTIPART_MAX_PART_SIZE)
+            let target = size.div_ceil(target_parts);
+            target.clamp(min_part, S3_MULTIPART_MAX_PART_SIZE)
         }
         None => {
             let tier = part_index / S3_PARTS_PER_TIER;
@@ -151,7 +180,7 @@ fn adaptive_part_size(object_size: Option<u64>, part_index: u32) -> u64 {
             if tier >= MAX_TIER {
                 S3_MULTIPART_MAX_PART_SIZE
             } else {
-                (MIN_PART << tier).min(S3_MULTIPART_MAX_PART_SIZE)
+                (min_part << tier).min(S3_MULTIPART_MAX_PART_SIZE)
             }
         }
     }
@@ -164,6 +193,9 @@ struct S3PartUploadContext<'a> {
     path: &'a ObjectPath,
     upload_id: &'a object_store::MultipartId,
     key: &'a str,
+    /// Maximum number of parts uploaded concurrently (honours the
+    /// `S3_MULTIPART_MAX_IN_FLIGHT_PARTS` env-var override; see [`S3Config`]).
+    max_in_flight: usize,
 }
 
 async fn collect_finished_s3_part(
@@ -195,8 +227,9 @@ async fn wait_for_s3_part_capacity(
     tasks: &mut JoinSet<S3PartUploadResult>,
     parts: &mut Vec<(usize, PartId)>,
     key: &str,
+    max_in_flight: usize,
 ) -> Result<()> {
-    while tasks.len() >= S3_MULTIPART_MAX_IN_FLIGHT_PARTS {
+    while tasks.len() >= max_in_flight {
         collect_finished_s3_part(tasks, parts, key).await?;
     }
     Ok(())
@@ -237,7 +270,7 @@ async fn enqueue_s3_part_upload(
     next_part_index: &mut usize,
     part: Bytes,
 ) -> Result<()> {
-    wait_for_s3_part_capacity(tasks, parts, context.key).await?;
+    wait_for_s3_part_capacity(tasks, parts, context.key, context.max_in_flight).await?;
     // Reject before spawning any part that would exceed a real S3 limit (the
     // 10,000-part cap or the 5 GiB per-part cap). The predicate is unit-tested
     // (`test_s3_part_within_limit_*`); keep the call here so a refactor of the
@@ -480,6 +513,17 @@ pub struct S3Config {
     /// longer than this are closed. Default: 90 seconds (matches hyper/reqwest
     /// defaults).
     pub pool_idle_timeout_secs: u64,
+    /// Multipart part size (bytes) used for the first `S3_PARTS_PER_TIER`
+    /// parts of an unknown-length stream, and the floor for adaptive sizing
+    /// of a known-length object. Default: 5 MiB (`S3_MULTIPART_CHUNK_SIZE`).
+    pub multipart_chunk_size: usize,
+    /// Maximum number of multipart parts uploaded concurrently. Default: 4
+    /// (`S3_MULTIPART_MAX_IN_FLIGHT_PARTS`).
+    pub multipart_max_in_flight_parts: usize,
+    /// Target number of multipart parts for a known-length object, used to
+    /// pick the per-object part size (kept comfortably under S3's 10,000-part
+    /// cap). Default: 9,000 (`S3_MULTIPART_TARGET_PARTS`).
+    pub multipart_target_parts: u64,
     /// Overall HTTP request timeout, in seconds, for bulk data transfer:
     /// payload get/put, streaming get/put, multipart part uploads, and
     /// server-side CopyObject. Control-plane calls keep [`S3_CONTROL_TIMEOUT`].
@@ -575,10 +619,27 @@ impl S3Config {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(S3_CONTROL_TIMEOUT.as_secs());
+        // `S3_MAX_SINGLE_COPY_SIZE` is the name an earlier ProVerse build used
+        // for the same knob; honour it as a fallback so existing deployments
+        // keep their setting.
         let max_single_copy_bytes: u64 = std::env::var("S3_MAX_SINGLE_COPY_BYTES")
+            .or_else(|_| std::env::var("S3_MAX_SINGLE_COPY_SIZE"))
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(S3_MAX_SINGLE_COPY_SIZE);
+        let multipart_chunk_size: usize = std::env::var("S3_MULTIPART_CHUNK_SIZE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(S3_MULTIPART_CHUNK_SIZE);
+        let multipart_max_in_flight_parts: usize =
+            std::env::var("S3_MULTIPART_MAX_IN_FLIGHT_PARTS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(S3_MULTIPART_MAX_IN_FLIGHT_PARTS);
+        let multipart_target_parts: u64 = std::env::var("S3_MULTIPART_TARGET_PARTS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(S3_MULTIPART_TARGET_PARTS);
 
         Ok(Self {
             bucket,
@@ -599,6 +660,9 @@ impl S3Config {
             bulk_timeout_secs,
             control_timeout_secs,
             max_single_copy_bytes,
+            multipart_chunk_size,
+            multipart_max_in_flight_parts,
+            multipart_target_parts,
         })
     }
 
@@ -665,6 +729,9 @@ impl S3Config {
             bulk_timeout_secs: S3_DEFAULT_BULK_TIMEOUT_SECS,
             control_timeout_secs: S3_CONTROL_TIMEOUT.as_secs(),
             max_single_copy_bytes: S3_MAX_SINGLE_COPY_SIZE,
+            multipart_chunk_size: S3_MULTIPART_CHUNK_SIZE,
+            multipart_max_in_flight_parts: S3_MULTIPART_MAX_IN_FLIGHT_PARTS,
+            multipart_target_parts: S3_MULTIPART_TARGET_PARTS,
         }
     }
 
@@ -733,6 +800,27 @@ impl S3Config {
     /// [`Self::max_single_copy_bytes`]). Clamped at use into [5 MiB, 5 GiB].
     pub fn with_max_single_copy_bytes(mut self, bytes: u64) -> Self {
         self.max_single_copy_bytes = bytes;
+        self
+    }
+
+    /// Override the multipart part size in bytes (see
+    /// [`Self::multipart_chunk_size`]).
+    pub fn with_multipart_chunk_size(mut self, chunk_size: usize) -> Self {
+        self.multipart_chunk_size = chunk_size;
+        self
+    }
+
+    /// Override the number of concurrently uploaded multipart parts (see
+    /// [`Self::multipart_max_in_flight_parts`]).
+    pub fn with_multipart_max_in_flight_parts(mut self, max_in_flight: usize) -> Self {
+        self.multipart_max_in_flight_parts = max_in_flight;
+        self
+    }
+
+    /// Override the target part count for known-length objects (see
+    /// [`Self::multipart_target_parts`]).
+    pub fn with_multipart_target_parts(mut self, target_parts: u64) -> Self {
+        self.multipart_target_parts = target_parts;
         self
     }
 }
@@ -971,6 +1059,12 @@ pub struct S3Backend {
     /// S3 multi-object delete API (POST ?delete). Needed for providers like
     /// Huawei Cloud OBS that do not implement DeleteObjects.
     disable_multi_delete: bool,
+    /// See [`S3Config::multipart_chunk_size`].
+    multipart_chunk_size: usize,
+    /// See [`S3Config::multipart_max_in_flight_parts`].
+    multipart_max_in_flight_parts: usize,
+    /// See [`S3Config::multipart_target_parts`].
+    multipart_target_parts: u64,
 }
 
 impl S3Backend {
@@ -1296,6 +1390,9 @@ impl S3Backend {
             path_format: config.path_format,
             signing_store,
             disable_multi_delete: config.disable_multi_delete,
+            multipart_chunk_size: config.multipart_chunk_size,
+            multipart_max_in_flight_parts: config.multipart_max_in_flight_parts,
+            multipart_target_parts: config.multipart_target_parts,
         })
     }
 
@@ -1817,7 +1914,7 @@ impl super::StorageBackend for S3Backend {
         let mut upload_tasks: JoinSet<S3PartUploadResult> = JoinSet::new();
         let mut uploaded_parts: Vec<(usize, PartId)> = Vec::new();
         let mut next_part_index = 0_usize;
-        let mut pending_part = BytesMut::with_capacity(S3_MULTIPART_CHUNK_SIZE);
+        let mut pending_part = BytesMut::with_capacity(self.multipart_chunk_size);
         let mut hasher = Sha256::new();
         let mut total: u64 = 0;
 
@@ -1843,12 +1940,16 @@ impl super::StorageBackend for S3Backend {
                     let mut data = data;
                     while !data.is_empty() {
                         // Adaptive: the target part size grows with the part index
-                        // for unknown-length streams (see `adaptive_part_size`), so
+                        // for unknown-length streams (see `adaptive_part_size_with`), so
                         // a 10,000-part budget can cover objects up to ~5 TiB. The
                         // first 1,000 parts stay at 5 MiB, leaving small/typical
                         // objects on the historical fixed-size happy path.
-                        let current_part_size =
-                            adaptive_part_size(None, next_part_index as u32) as usize;
+                        let current_part_size = adaptive_part_size_with(
+                            self.multipart_chunk_size as u64,
+                            self.multipart_target_parts,
+                            None,
+                            next_part_index as u32,
+                        ) as usize;
                         if pending_part.is_empty() && data.len() >= current_part_size {
                             let part = data.split_to(current_part_size);
                             if let Err(e) = enqueue_s3_part_upload(
@@ -1861,6 +1962,7 @@ impl super::StorageBackend for S3Backend {
                                         .as_ref()
                                         .expect("multipart upload id initialized above"),
                                     key,
+                                    max_in_flight: self.multipart_max_in_flight_parts,
                                 },
                                 &mut next_part_index,
                                 part,
@@ -1890,6 +1992,7 @@ impl super::StorageBackend for S3Backend {
                                         .as_ref()
                                         .expect("multipart upload id initialized above"),
                                     key,
+                                    max_in_flight: self.multipart_max_in_flight_parts,
                                 },
                                 &mut next_part_index,
                                 part,
@@ -1923,6 +2026,7 @@ impl super::StorageBackend for S3Backend {
                         path: &path,
                         upload_id: &upload_id,
                         key,
+                        max_in_flight: self.multipart_max_in_flight_parts,
                     },
                     &mut next_part_index,
                     pending_part.freeze(),
@@ -2643,11 +2747,21 @@ mod tests {
     fn test_adaptive_part_size_small_known_object_uses_min_part() {
         // A tiny object never goes below the 5 MiB minimum part size.
         assert_eq!(
-            adaptive_part_size(Some(1), 0),
+            adaptive_part_size_with(
+                S3_MULTIPART_CHUNK_SIZE as u64,
+                S3_MULTIPART_TARGET_PARTS,
+                Some(1),
+                0
+            ),
             S3_MULTIPART_CHUNK_SIZE as u64
         );
         assert_eq!(
-            adaptive_part_size(Some(10 * MIB), 0),
+            adaptive_part_size_with(
+                S3_MULTIPART_CHUNK_SIZE as u64,
+                S3_MULTIPART_TARGET_PARTS,
+                Some(10 * MIB),
+                0
+            ),
             S3_MULTIPART_CHUNK_SIZE as u64
         );
     }
@@ -2656,15 +2770,41 @@ mod tests {
     fn test_adaptive_part_size_known_object_part_index_is_irrelevant() {
         // For a known size the part size is fixed regardless of index.
         let size = Some(100 * GIB);
-        let p0 = adaptive_part_size(size, 0);
-        assert_eq!(p0, adaptive_part_size(size, 5_000));
-        assert_eq!(p0, adaptive_part_size(size, 8_999));
+        let p0 = adaptive_part_size_with(
+            S3_MULTIPART_CHUNK_SIZE as u64,
+            S3_MULTIPART_TARGET_PARTS,
+            size,
+            0,
+        );
+        assert_eq!(
+            p0,
+            adaptive_part_size_with(
+                S3_MULTIPART_CHUNK_SIZE as u64,
+                S3_MULTIPART_TARGET_PARTS,
+                size,
+                5_000
+            )
+        );
+        assert_eq!(
+            p0,
+            adaptive_part_size_with(
+                S3_MULTIPART_CHUNK_SIZE as u64,
+                S3_MULTIPART_TARGET_PARTS,
+                size,
+                8_999
+            )
+        );
     }
 
     #[test]
     fn test_adaptive_part_size_known_100gib_stays_under_cap_and_max() {
         let size = 100 * GIB;
-        let part = adaptive_part_size(Some(size), 0);
+        let part = adaptive_part_size_with(
+            S3_MULTIPART_CHUNK_SIZE as u64,
+            S3_MULTIPART_TARGET_PARTS,
+            Some(size),
+            0,
+        );
         assert!(
             part <= S3_MULTIPART_MAX_PART_SIZE,
             "part {part} must not exceed the 5 GiB per-part max"
@@ -2680,7 +2820,12 @@ mod tests {
     fn test_adaptive_part_size_known_50gib_boundary() {
         // The historical artificial ceiling: 50 GiB must now be well within limits.
         let size = 50 * GIB;
-        let part = adaptive_part_size(Some(size), 0);
+        let part = adaptive_part_size_with(
+            S3_MULTIPART_CHUNK_SIZE as u64,
+            S3_MULTIPART_TARGET_PARTS,
+            Some(size),
+            0,
+        );
         let parts = size.div_ceil(part);
         assert!(parts <= S3_MULTIPART_MAX_PARTS as u64);
         assert!(part <= S3_MULTIPART_MAX_PART_SIZE);
@@ -2694,7 +2839,12 @@ mod tests {
         // below the 5 GiB per-part max, so it is used directly and the part count
         // stays at the 9,000-part target (<= the 10,000 cap).
         let size = 5 * TIB;
-        let part = adaptive_part_size(Some(size), 0);
+        let part = adaptive_part_size_with(
+            S3_MULTIPART_CHUNK_SIZE as u64,
+            S3_MULTIPART_TARGET_PARTS,
+            Some(size),
+            0,
+        );
         assert!(
             part <= S3_MULTIPART_MAX_PART_SIZE,
             "part {part} must not exceed the 5 GiB per-part max"
@@ -2717,7 +2867,12 @@ mod tests {
         // size to the 5 GiB per-part maximum (the absolute ceiling is 5 GiB x
         // 10,000 = ~48.8 TiB, well above S3's real 5 TiB object limit).
         let size = 9_000 * (6 * GIB); // ceil(size/9000) = 6 GiB > MAX_PART
-        let part = adaptive_part_size(Some(size), 0);
+        let part = adaptive_part_size_with(
+            S3_MULTIPART_CHUNK_SIZE as u64,
+            S3_MULTIPART_TARGET_PARTS,
+            Some(size),
+            0,
+        );
         assert_eq!(part, S3_MULTIPART_MAX_PART_SIZE);
     }
 
@@ -2725,9 +2880,22 @@ mod tests {
     fn test_adaptive_part_size_unknown_first_tier_is_min_part() {
         // The first 1,000 parts of a stream stay at 5 MiB so small/typical
         // objects behave exactly like the historical fixed-size path.
-        assert_eq!(adaptive_part_size(None, 0), S3_MULTIPART_CHUNK_SIZE as u64);
         assert_eq!(
-            adaptive_part_size(None, 999),
+            adaptive_part_size_with(
+                S3_MULTIPART_CHUNK_SIZE as u64,
+                S3_MULTIPART_TARGET_PARTS,
+                None,
+                0
+            ),
+            S3_MULTIPART_CHUNK_SIZE as u64
+        );
+        assert_eq!(
+            adaptive_part_size_with(
+                S3_MULTIPART_CHUNK_SIZE as u64,
+                S3_MULTIPART_TARGET_PARTS,
+                None,
+                999
+            ),
             S3_MULTIPART_CHUNK_SIZE as u64
         );
     }
@@ -2736,11 +2904,21 @@ mod tests {
     fn test_adaptive_part_size_unknown_doubles_each_tier() {
         // Size doubles every S3_PARTS_PER_TIER parts: 5 MiB -> 10 MiB -> 20 MiB.
         assert_eq!(
-            adaptive_part_size(None, S3_PARTS_PER_TIER),
+            adaptive_part_size_with(
+                S3_MULTIPART_CHUNK_SIZE as u64,
+                S3_MULTIPART_TARGET_PARTS,
+                None,
+                S3_PARTS_PER_TIER
+            ),
             2 * S3_MULTIPART_CHUNK_SIZE as u64
         );
         assert_eq!(
-            adaptive_part_size(None, 2 * S3_PARTS_PER_TIER),
+            adaptive_part_size_with(
+                S3_MULTIPART_CHUNK_SIZE as u64,
+                S3_MULTIPART_TARGET_PARTS,
+                None,
+                2 * S3_PARTS_PER_TIER
+            ),
             4 * S3_MULTIPART_CHUNK_SIZE as u64
         );
     }
@@ -2749,16 +2927,31 @@ mod tests {
     fn test_adaptive_part_size_unknown_caps_at_max_part() {
         // 5 MiB << 10 = 5 GiB == max part; tier 10 and beyond stay at the cap.
         assert_eq!(
-            adaptive_part_size(None, 10 * S3_PARTS_PER_TIER),
+            adaptive_part_size_with(
+                S3_MULTIPART_CHUNK_SIZE as u64,
+                S3_MULTIPART_TARGET_PARTS,
+                None,
+                10 * S3_PARTS_PER_TIER
+            ),
             S3_MULTIPART_MAX_PART_SIZE
         );
         assert_eq!(
-            adaptive_part_size(None, 50 * S3_PARTS_PER_TIER),
+            adaptive_part_size_with(
+                S3_MULTIPART_CHUNK_SIZE as u64,
+                S3_MULTIPART_TARGET_PARTS,
+                None,
+                50 * S3_PARTS_PER_TIER
+            ),
             S3_MULTIPART_MAX_PART_SIZE
         );
         // Far-future index that would overflow a naive shift must still be capped.
         assert_eq!(
-            adaptive_part_size(None, u32::MAX),
+            adaptive_part_size_with(
+                S3_MULTIPART_CHUNK_SIZE as u64,
+                S3_MULTIPART_TARGET_PARTS,
+                None,
+                u32::MAX
+            ),
             S3_MULTIPART_MAX_PART_SIZE
         );
     }
@@ -2770,7 +2963,12 @@ mod tests {
         // exceeding the per-part max or the part cap.
         let mut total: u64 = 0;
         for idx in 0..S3_MULTIPART_MAX_PARTS as u32 {
-            let part = adaptive_part_size(None, idx);
+            let part = adaptive_part_size_with(
+                S3_MULTIPART_CHUNK_SIZE as u64,
+                S3_MULTIPART_TARGET_PARTS,
+                None,
+                idx,
+            );
             assert!(
                 part <= S3_MULTIPART_MAX_PART_SIZE,
                 "part at idx {idx} exceeded the 5 GiB max"
@@ -4097,7 +4295,14 @@ mod tests {
             None,
         )
         .with_disable_multi_delete(disable_multi_delete);
+        mock_s3_backend_with_config(config).await
+    }
 
+    /// Build an S3Backend for a wiremock server from an arbitrary `S3Config`,
+    /// so tests can exercise the operator-tunable knobs (multipart part size,
+    /// in-flight parts, timeouts) without going through `S3Backend::new`'s
+    /// credential validation.
+    async fn mock_s3_backend_with_config(config: S3Config) -> S3Backend {
         // build_store needs explicit creds so the signer can produce URLs
         let store = S3Backend::build_store(&config, Some("AKIAIOSFODNN7EXAMPLE"), Some("secret"))
             .expect("build mock store");
@@ -4109,16 +4314,20 @@ mod tests {
             bulk_store,
             bucket: config.bucket.clone(),
             region: config.region.clone(),
-            bulk_timeout: Some(Duration::from_secs(S3_DEFAULT_BULK_TIMEOUT_SECS)),
+            bulk_timeout: (config.bulk_timeout_secs > 0)
+                .then(|| Duration::from_secs(config.bulk_timeout_secs)),
             raw_http: reqwest::Client::new(),
-            max_single_copy_bytes: S3_MAX_SINGLE_COPY_SIZE,
+            max_single_copy_bytes: S3Backend::effective_single_copy_ceiling(&config),
             sign_requests: true,
             prefix: None,
             redirect_downloads: false,
             cloudfront: None,
             path_format: StoragePathFormat::Native,
             signing_store: None,
-            disable_multi_delete,
+            disable_multi_delete: config.disable_multi_delete,
+            multipart_chunk_size: config.multipart_chunk_size,
+            multipart_max_in_flight_parts: config.multipart_max_in_flight_parts,
+            multipart_target_parts: config.multipart_target_parts,
         }
     }
 
@@ -4398,6 +4607,9 @@ mod tests {
                 path_format: StoragePathFormat::Native,
                 signing_store: None,
                 disable_multi_delete: false,
+                multipart_chunk_size: S3_MULTIPART_CHUNK_SIZE,
+                multipart_max_in_flight_parts: S3_MULTIPART_MAX_IN_FLIGHT_PARTS,
+                multipart_target_parts: S3_MULTIPART_TARGET_PARTS,
             };
             backend.copy("src-key", "dst-key").await
         }
@@ -4478,6 +4690,9 @@ mod tests {
             path_format: StoragePathFormat::Native,
             signing_store: None,
             disable_multi_delete: false,
+            multipart_chunk_size: S3_MULTIPART_CHUNK_SIZE,
+            multipart_max_in_flight_parts: S3_MULTIPART_MAX_IN_FLIGHT_PARTS,
+            multipart_target_parts: S3_MULTIPART_TARGET_PARTS,
         };
 
         let bulk = StorageBackendTrait::get(&backend, "slow-key").await;
@@ -4598,6 +4813,173 @@ mod tests {
 
         // The hung parts never return; drop the task rather than wait out the delay.
         upload.abort();
+    }
+
+    #[test]
+    fn test_multipart_tuning_env_overrides_are_honoured() {
+        let vars = [
+            "S3_MULTIPART_CHUNK_SIZE",
+            "S3_MULTIPART_MAX_IN_FLIGHT_PARTS",
+            "S3_MULTIPART_TARGET_PARTS",
+            "S3_MAX_SINGLE_COPY_BYTES",
+            "S3_MAX_SINGLE_COPY_SIZE",
+            "S3_BUCKET",
+        ];
+        let saved: Vec<Option<String>> = vars.iter().map(|v| std::env::var(v).ok()).collect();
+        for v in &vars {
+            std::env::remove_var(v);
+        }
+        std::env::set_var("S3_BUCKET", "multipart-tuning-test-bucket");
+
+        // Defaults match the constants.
+        let config = S3Config::from_env().expect("from_env should succeed");
+        assert_eq!(config.multipart_chunk_size, S3_MULTIPART_CHUNK_SIZE);
+        assert_eq!(
+            config.multipart_max_in_flight_parts,
+            S3_MULTIPART_MAX_IN_FLIGHT_PARTS
+        );
+        assert_eq!(config.multipart_target_parts, S3_MULTIPART_TARGET_PARTS);
+        assert_eq!(config.max_single_copy_bytes, S3_MAX_SINGLE_COPY_SIZE);
+
+        // Numeric overrides are honoured.
+        std::env::set_var("S3_MULTIPART_CHUNK_SIZE", "16777216");
+        std::env::set_var("S3_MULTIPART_MAX_IN_FLIGHT_PARTS", "8");
+        std::env::set_var("S3_MULTIPART_TARGET_PARTS", "5000");
+        let config = S3Config::from_env().expect("from_env should succeed");
+        assert_eq!(config.multipart_chunk_size, 16 * 1024 * 1024);
+        assert_eq!(config.multipart_max_in_flight_parts, 8);
+        assert_eq!(config.multipart_target_parts, 5_000);
+
+        // Garbage falls back to the defaults.
+        std::env::set_var("S3_MULTIPART_CHUNK_SIZE", "huge");
+        std::env::set_var("S3_MULTIPART_MAX_IN_FLIGHT_PARTS", "-1");
+        std::env::set_var("S3_MULTIPART_TARGET_PARTS", "many");
+        let config = S3Config::from_env().expect("from_env should succeed");
+        assert_eq!(config.multipart_chunk_size, S3_MULTIPART_CHUNK_SIZE);
+        assert_eq!(
+            config.multipart_max_in_flight_parts,
+            S3_MULTIPART_MAX_IN_FLIGHT_PARTS
+        );
+        assert_eq!(config.multipart_target_parts, S3_MULTIPART_TARGET_PARTS);
+
+        // The legacy S3_MAX_SINGLE_COPY_SIZE name is a fallback alias for
+        // S3_MAX_SINGLE_COPY_BYTES; the canonical name wins when both are set.
+        std::env::set_var("S3_MAX_SINGLE_COPY_SIZE", "1024");
+        let config = S3Config::from_env().expect("from_env should succeed");
+        assert_eq!(config.max_single_copy_bytes, 1024);
+        std::env::set_var("S3_MAX_SINGLE_COPY_BYTES", "2048");
+        let config = S3Config::from_env().expect("from_env should succeed");
+        assert_eq!(config.max_single_copy_bytes, 2048);
+
+        for (v, s) in vars.iter().zip(saved) {
+            match s {
+                Some(val) => std::env::set_var(v, val),
+                None => std::env::remove_var(v),
+            }
+        }
+    }
+
+    #[test]
+    fn test_adaptive_part_size_with_honours_custom_min_part_and_target() {
+        // A larger configured part size lifts the floor for known sizes ...
+        let min_part = 16 * MIB;
+        assert_eq!(
+            adaptive_part_size_with(min_part, S3_MULTIPART_TARGET_PARTS, Some(1), 0),
+            min_part
+        );
+        // ... and is the first-tier size for unknown-length streams, doubling
+        // per tier from that base.
+        assert_eq!(adaptive_part_size_with(min_part, 9_000, None, 0), min_part);
+        assert_eq!(
+            adaptive_part_size_with(min_part, 9_000, None, S3_PARTS_PER_TIER),
+            2 * min_part
+        );
+        // A lower target part count means larger parts for the same object.
+        let size = 100 * GIB;
+        let default_target =
+            adaptive_part_size_with(S3_MULTIPART_CHUNK_SIZE as u64, 9_000, Some(size), 0);
+        let low_target =
+            adaptive_part_size_with(S3_MULTIPART_CHUNK_SIZE as u64, 1_000, Some(size), 0);
+        assert!(low_target > default_target);
+        assert_eq!(low_target, size.div_ceil(1_000));
+        // The 5 GiB per-part ceiling still applies whatever the knobs say.
+        assert_eq!(
+            adaptive_part_size_with(S3_MULTIPART_MAX_PART_SIZE * 2, 9_000, None, 0),
+            S3_MULTIPART_MAX_PART_SIZE
+        );
+    }
+
+    /// The configured part size must actually drive `put_stream`'s part
+    /// boundaries: with an 8-byte part size a 20-byte stream is uploaded as
+    /// exactly three parts (8 + 8 + 4).
+    #[tokio::test]
+    async fn test_put_stream_honours_configured_multipart_chunk_size() {
+        use crate::storage::StorageBackend as StorageBackendTrait;
+        use wiremock::matchers::{method, query_param, query_param_is_missing};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(query_param_is_missing("uploadId"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<InitiateMultipartUploadResult><UploadId>chunk-upload-id</UploadId></InitiateMultipartUploadResult>",
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(query_param("uploadId", "chunk-upload-id"))
+            .respond_with(ResponseTemplate::new(200).insert_header("ETag", "\"part-etag\""))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(query_param("uploadId", "chunk-upload-id"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<CompleteMultipartUploadResult><ETag>\"complete-etag\"</ETag></CompleteMultipartUploadResult>",
+            ))
+            .mount(&server)
+            .await;
+
+        let config = S3Config::new(
+            "test-bucket".to_string(),
+            "us-east-1".to_string(),
+            Some(server.uri()),
+            None,
+        )
+        .with_multipart_chunk_size(8)
+        .with_multipart_max_in_flight_parts(1);
+        let backend = mock_s3_backend_with_config(config).await;
+
+        let body = b"twenty-bytes-of-data".to_vec();
+        assert_eq!(body.len(), 20);
+        let stream = futures::stream::iter(vec![Ok(Bytes::from(body.clone()))]);
+        let result = StorageBackendTrait::put_stream(&backend, "chunked", Box::pin(stream))
+            .await
+            .expect("put_stream should succeed against the mock");
+        assert_eq!(result.bytes_written, 20);
+
+        let requests = server.received_requests().await.unwrap_or_default();
+        let mut part_numbers: Vec<usize> = requests
+            .iter()
+            .filter(|r| r.method.as_str() == "PUT")
+            .filter_map(|r| {
+                r.url
+                    .query_pairs()
+                    .find_map(|(k, v)| (k == "partNumber").then(|| v.parse::<usize>().unwrap()))
+            })
+            .collect();
+        part_numbers.sort_unstable();
+        assert_eq!(
+            part_numbers,
+            vec![1, 2, 3],
+            "an 8-byte part size must split 20 bytes into exactly 3 parts"
+        );
+        let mut part_lens: Vec<usize> = requests
+            .iter()
+            .filter(|r| r.method.as_str() == "PUT")
+            .map(|r| r.body.len())
+            .collect();
+        part_lens.sort_unstable();
+        assert_eq!(part_lens, vec![4, 8, 8]);
     }
 
     #[tokio::test]
