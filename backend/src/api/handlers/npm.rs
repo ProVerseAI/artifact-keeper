@@ -2123,7 +2123,7 @@ struct NpmMetadataArtifact {
 ///
 /// `repo_key` should be the key visible to the client (the virtual repo key
 /// when serving through a virtual repository, or the repo's own key otherwise).
-#[allow(clippy::result_large_err)]
+#[allow(clippy::result_large_err, clippy::too_many_arguments)]
 fn build_npm_metadata_response(
     artifacts: &[NpmMetadataArtifact],
     package_name: &str,
@@ -2131,6 +2131,7 @@ fn build_npm_metadata_response(
     repo_key: &str,
     stored_dist_tags: &serde_json::Map<String, serde_json::Value>,
     want_abbreviated: bool,
+    legacy_metadata: bool,
 ) -> Result<Response, Response> {
     Ok(respond_with_packument(
         build_npm_metadata_value(
@@ -2139,6 +2140,7 @@ fn build_npm_metadata_response(
             base_url,
             repo_key,
             stored_dist_tags,
+            legacy_metadata,
         ),
         want_abbreviated,
     ))
@@ -2148,12 +2150,16 @@ fn build_npm_metadata_response(
 /// value form of [`build_npm_metadata_response`], split out so the virtual
 /// member merge (#2844) can combine per-member contributions before a single
 /// response is emitted.
+/// `legacy_metadata` mirrors the repository's `npm_legacy_metadata` config
+/// flag (see [`NPM_LEGACY_METADATA_KEY`]): when set, a stored `dist.shasum`
+/// is emitted alongside `dist.integrity` for Unity Package Manager (BUG-003).
 fn build_npm_metadata_value(
     artifacts: &[NpmMetadataArtifact],
     package_name: &str,
     base_url: &str,
     repo_key: &str,
     stored_dist_tags: &serde_json::Map<String, serde_json::Value>,
+    legacy_metadata: bool,
 ) -> serde_json::Value {
     let mut versions = serde_json::Map::new();
     let mut version_list: Vec<String> = Vec::new();
@@ -2173,12 +2179,22 @@ fn build_npm_metadata_value(
             .as_ref()
             .and_then(|m| m.get("version_data").cloned());
 
+        // BUG-003: `dist_extra` is written by `store_npm_version` at publish
+        // time and carries the standard sha512- SRI integrity plus, when the
+        // repo had legacy metadata enabled, the hex SHA-1 shasum UPM needs.
+        let dist_extra = artifact
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("dist_extra").cloned());
+
         let version_obj = build_npm_version_entry(&NpmArtifactInfo {
             version: version.clone(),
             checksum_sha256: artifact.checksum_sha256.clone(),
             tarball_url,
             version_metadata,
             package_name: package_name.to_string(),
+            dist_extra,
+            legacy_metadata,
         });
 
         versions.insert(version.clone(), version_obj);
@@ -2353,6 +2369,50 @@ async fn fetch_npm_artifacts(
             metadata: a.metadata,
         })
         .collect())
+}
+
+// ---------------------------------------------------------------------------
+// npm legacy metadata mode (BUG-003 / Unity Package Manager compatibility)
+// ---------------------------------------------------------------------------
+
+/// `repository_config` key enabling legacy npm metadata for hosted packages
+/// ("true"/"false", default unset = false/off).
+///
+/// Unity Package Manager (UPM) requires `dist.shasum` (hex SHA-1 of the
+/// tarball) and does not understand the modern `dist.integrity` SRI field.
+/// When enabled, hosted npm publishes additionally hash the tarball with
+/// SHA-1 and store it so `dist.shasum` can be served; when disabled (the
+/// default), `dist.shasum` continues to be omitted, matching prior behaviour
+/// exactly, and the extra SHA-1 hash is skipped.
+///
+/// Note this only takes effect for artifacts published *after* the flag is
+/// turned on — there is no retroactive backfill of `dist.shasum` for already
+/// published versions in this change. Existing hosted packages must be
+/// republished to pick up `dist.shasum` once the flag is enabled.
+///
+/// This is independent of the `dist.integrity` prefix fix (`sha256-` →
+/// `sha512-`), which is unconditional and applies regardless of this flag.
+pub(crate) const NPM_LEGACY_METADATA_KEY: &str = "npm_legacy_metadata";
+
+/// Look up whether legacy npm metadata mode is enabled for a repository.
+///
+/// Unlike the scope policy below, this is a compatibility toggle, not a
+/// security control, so a DB error or a corrupt stored value simply falls
+/// back to `false` (the historical default) rather than failing the request.
+async fn npm_legacy_metadata_enabled(db: &PgPool, repo_id: uuid::Uuid) -> bool {
+    let value: Option<String> = sqlx::query_scalar(
+        "SELECT value FROM repository_config WHERE repository_id = $1 AND key = $2",
+    )
+    .bind(repo_id)
+    .bind(NPM_LEGACY_METADATA_KEY)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten();
+
+    value
+        .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+        .unwrap_or(false)
 }
 
 // ---------------------------------------------------------------------------
@@ -2701,6 +2761,7 @@ async fn get_package_metadata(
     }
 
     let dist_tags = fetch_npm_dist_tags(&state.db, repo.id, package_name).await;
+    let legacy_metadata = npm_legacy_metadata_enabled(&state.db, repo.id).await;
     build_npm_metadata_response(
         &meta_artifacts,
         package_name,
@@ -2708,6 +2769,7 @@ async fn get_package_metadata(
         repo_key,
         &dist_tags,
         want_abbreviated,
+        legacy_metadata,
     )
 }
 
@@ -2740,6 +2802,7 @@ async fn get_package_version_metadata(
         }
         // Version extraction ignores dist-tags; pass an empty map.
         // Always build the full packument here so the version can be extracted.
+        let legacy_metadata = npm_legacy_metadata_enabled(&state.db, repo.id).await;
         let resp = build_npm_metadata_response(
             &artifacts,
             package_name,
@@ -2747,6 +2810,7 @@ async fn get_package_version_metadata(
             repo_key,
             &serde_json::Map::new(),
             false,
+            legacy_metadata,
         )?;
         #[allow(clippy::disallowed_methods)]
         // STREAMING-EXEMPT: capped-metadata read (upstream index/advisory/packument, not an artifact blob); bounded response buffered; tracked under #1608
@@ -2981,12 +3045,14 @@ async fn virtual_member_packument_contribution(
             return Ok(None);
         }
         let dist_tags = fetch_npm_dist_tags(&state.db, member.id, package_name).await;
+        let legacy_metadata = npm_legacy_metadata_enabled(&state.db, member.id).await;
         return Ok(Some(build_npm_metadata_value(
             &meta,
             package_name,
             base_url,
             repo_key,
             &dist_tags,
+            legacy_metadata,
         )));
     }
 
@@ -4242,14 +4308,26 @@ struct NpmVersionToPublish {
     tarball_filename: String,
     tarball_bytes: Vec<u8>,
     sha256: String,
+    /// Standard npm `dist.integrity` value (`sha512-{base64}`), always
+    /// computed (BUG-003: fixes the previous non-standard `sha256-` prefix).
+    integrity_sha512: String,
+    /// Legacy `dist.shasum` value (hex SHA-1), only computed when the
+    /// repository has `npm_legacy_metadata` enabled (BUG-003 / UPM
+    /// compatibility) — `None` otherwise so the extra hash is skipped.
+    shasum_sha1: Option<String>,
 }
 
 /// Parse and validate the raw npm publish JSON body into structured data.
 /// Returns an error response if the payload is malformed.
+///
+/// `legacy_metadata` mirrors the repository's `npm_legacy_metadata` config
+/// flag (see [`NPM_LEGACY_METADATA_KEY`]) and controls whether the legacy
+/// SHA-1 `dist.shasum` is computed for each version.
 #[allow(clippy::result_large_err)]
 fn parse_npm_publish_payload(
     body: &Bytes,
     package_name: &str,
+    legacy_metadata: bool,
 ) -> Result<ParsedNpmPublish, Response> {
     let payload: serde_json::Value = serde_json::from_slice(body).map_err(|e| {
         AppError::Validation(format!("Invalid JSON payload: {}", e)).into_response()
@@ -4284,8 +4362,13 @@ fn parse_npm_publish_payload(
 
     let mut versions = Vec::new();
     for (version, version_data) in versions_obj {
-        let parsed =
-            extract_version_tarball(package_name, version, version_data.clone(), attachments_obj)?;
+        let parsed = extract_version_tarball(
+            package_name,
+            version,
+            version_data.clone(),
+            attachments_obj,
+            legacy_metadata,
+        )?;
         versions.push(parsed);
     }
 
@@ -4310,6 +4393,7 @@ fn extract_version_tarball(
     version: &str,
     version_data: serde_json::Value,
     attachments_obj: &serde_json::Map<String, serde_json::Value>,
+    legacy_metadata: bool,
 ) -> Result<NpmVersionToPublish, Response> {
     let tarball_filename = if package_name.starts_with('@') {
         let short_name = package_name.rsplit('/').next().unwrap_or(package_name);
@@ -4341,12 +4425,27 @@ fn extract_version_tarball(
     hasher.update(&tarball_bytes);
     let sha256 = format!("{:x}", hasher.finalize());
 
+    let mut sha512_hasher = sha2::Sha512::new();
+    sha512_hasher.update(&tarball_bytes);
+    let integrity_sha512 = format!(
+        "sha512-{}",
+        base64::engine::general_purpose::STANDARD.encode(sha512_hasher.finalize())
+    );
+
+    let shasum_sha1 = legacy_metadata.then(|| {
+        let mut sha1_hasher = sha1::Sha1::new();
+        sha1_hasher.update(&tarball_bytes);
+        format!("{:x}", sha1_hasher.finalize())
+    });
+
     Ok(NpmVersionToPublish {
         version: version.to_string(),
         version_data,
         tarball_filename,
         tarball_bytes,
         sha256,
+        integrity_sha512,
+        shasum_sha1,
     })
 }
 
@@ -4430,11 +4529,18 @@ async fn store_npm_version(
     crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo_id, artifact_id)
         .await;
 
-    // Store metadata
+    // Store metadata, including the dist fields BUG-003 needs at serve time:
+    // `integrity` is always the standard sha512- SRI value; `shasum` (legacy
+    // hex SHA-1) is only present when the repo's npm_legacy_metadata flag was
+    // on at publish time.
     let npm_metadata = serde_json::json!({
         "name": package_name,
         "version": ver.version,
         "version_data": ver.version_data,
+        "dist_extra": {
+            "integrity": ver.integrity_sha512,
+            "shasum": ver.shasum_sha1,
+        },
     });
 
     let _ = sqlx::query(
@@ -4493,7 +4599,8 @@ async fn publish_package(
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
 
-    let parsed = parse_npm_publish_payload(&body, package_name)?;
+    let legacy_metadata = npm_legacy_metadata_enabled(&state.db, repo.id).await;
+    let parsed = parse_npm_publish_payload(&body, package_name, legacy_metadata)?;
 
     for ver in &parsed.versions {
         store_npm_version(
@@ -4924,11 +5031,39 @@ struct NpmArtifactInfo {
     tarball_url: String,
     version_metadata: Option<serde_json::Value>,
     package_name: String,
+    /// The `dist_extra` block `store_npm_version` persisted at publish time
+    /// (`{"integrity": "sha512-...", "shasum": "<hex sha1>" | null}`), or
+    /// `None` for artifacts published before it existed (BUG-003).
+    dist_extra: Option<serde_json::Value>,
+    /// Whether the serving repository has `npm_legacy_metadata` enabled, which
+    /// gates emitting `dist.shasum` (see [`NPM_LEGACY_METADATA_KEY`]).
+    legacy_metadata: bool,
 }
 
 /// Build a single npm version entry for the metadata response.
 fn build_npm_version_entry(info: &NpmArtifactInfo) -> serde_json::Value {
-    let integrity = compute_npm_integrity(&info.checksum_sha256);
+    // BUG-003: prefer the standard sha512- SRI value stored at publish time;
+    // artifacts published before this change have no `dist_extra`, so fall
+    // back to the old (non-standard) sha256- computation for those until they
+    // are republished.
+    let stored_integrity = info
+        .dist_extra
+        .as_ref()
+        .and_then(|d| d.get("integrity"))
+        .and_then(|v| v.as_str());
+    let integrity = match stored_integrity {
+        Some(sha512) => sha512.to_string(),
+        None => compute_npm_integrity(&info.checksum_sha256),
+    };
+    let shasum = info
+        .legacy_metadata
+        .then(|| {
+            info.dist_extra
+                .as_ref()
+                .and_then(|d| d.get("shasum"))
+                .and_then(|v| v.as_str())
+        })
+        .flatten();
 
     let mut version_obj = info
         .version_metadata
@@ -4942,13 +5077,14 @@ fn build_npm_version_entry(info: &NpmArtifactInfo) -> serde_json::Value {
         .or_insert_with(|| serde_json::Value::String(info.package_name.clone()));
     obj.entry("version".to_string())
         .or_insert_with(|| serde_json::Value::String(info.version.clone()));
-    obj.insert(
-        "dist".to_string(),
-        serde_json::json!({
-            "tarball": info.tarball_url,
-            "integrity": integrity,
-        }),
-    );
+    let mut dist = serde_json::json!({
+        "tarball": info.tarball_url,
+        "integrity": integrity,
+    });
+    if let Some(shasum) = shasum {
+        dist["shasum"] = serde_json::Value::String(shasum.to_string());
+    }
+    obj.insert("dist".to_string(), dist);
 
     version_obj
 }
@@ -5840,6 +5976,68 @@ mod tests {
         assert!(with_patterns.allows("@acme/thing"));
         assert!(with_patterns.allows("internal-utils"));
         assert!(!with_patterns.allows("random-pkg"));
+
+        // Cleanup.
+        let _ = sqlx::query("DELETE FROM repository_config WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+    }
+
+    /// DB-backed: `npm_legacy_metadata_enabled` round-trips the
+    /// `repository_config` `npm_legacy_metadata` key (BUG-003). Unlike the
+    /// scope policy, this is a compatibility toggle, not a security control:
+    /// an absent or corrupt value both fall back to `false` rather than
+    /// failing the request. Skips when no `DATABASE_URL` is configured.
+    #[tokio::test]
+    async fn npm_legacy_metadata_enabled_reads_stored_config_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, _key, _dir) = tdh::create_repo(&pool, "local", "npm").await;
+
+        // No row stored: default is off.
+        assert!(!npm_legacy_metadata_enabled(&pool, repo_id).await);
+
+        sqlx::query(
+            "INSERT INTO repository_config (repository_id, key, value) VALUES ($1, $2, $3)",
+        )
+        .bind(repo_id)
+        .bind(NPM_LEGACY_METADATA_KEY)
+        .bind("true")
+        .execute(&pool)
+        .await
+        .expect("upsert repository_config");
+        assert!(npm_legacy_metadata_enabled(&pool, repo_id).await);
+
+        sqlx::query(
+            "UPDATE repository_config SET value = $3 WHERE repository_id = $1 AND key = $2",
+        )
+        .bind(repo_id)
+        .bind(NPM_LEGACY_METADATA_KEY)
+        .bind("false")
+        .execute(&pool)
+        .await
+        .expect("update repository_config");
+        assert!(!npm_legacy_metadata_enabled(&pool, repo_id).await);
+
+        // A corrupt value is a compatibility toggle, not a security control:
+        // fall back to false rather than failing the request.
+        sqlx::query(
+            "UPDATE repository_config SET value = $3 WHERE repository_id = $1 AND key = $2",
+        )
+        .bind(repo_id)
+        .bind(NPM_LEGACY_METADATA_KEY)
+        .bind("not-a-bool")
+        .execute(&pool)
+        .await
+        .expect("update repository_config");
+        assert!(!npm_legacy_metadata_enabled(&pool, repo_id).await);
 
         // Cleanup.
         let _ = sqlx::query("DELETE FROM repository_config WHERE repository_id = $1")
@@ -7145,6 +7343,8 @@ mod tests {
             tarball_url,
             version_metadata: metadata,
             package_name: pkg.to_string(),
+            dist_extra: None,
+            legacy_metadata: false,
         }
     }
 
@@ -7223,7 +7423,7 @@ mod tests {
     #[test]
     fn test_parse_npm_publish_payload_valid() {
         let body = make_valid_publish_body("express", "4.18.2");
-        let result = parse_npm_publish_payload(&body, "express");
+        let result = parse_npm_publish_payload(&body, "express", false);
         assert!(result.is_ok());
         let parsed = result.unwrap();
         assert_eq!(parsed.versions.len(), 1);
@@ -7236,7 +7436,7 @@ mod tests {
     #[test]
     fn test_parse_npm_publish_payload_scoped() {
         let body = make_valid_publish_body("@babel/core", "7.24.0");
-        let result = parse_npm_publish_payload(&body, "@babel/core");
+        let result = parse_npm_publish_payload(&body, "@babel/core", false);
         assert!(result.is_ok());
         let parsed = result.unwrap();
         assert_eq!(parsed.versions[0].version, "7.24.0");
@@ -7246,7 +7446,7 @@ mod tests {
     #[test]
     fn test_parse_npm_publish_payload_invalid_json() {
         let body = Bytes::from(b"not json at all".to_vec());
-        let result = parse_npm_publish_payload(&body, "pkg");
+        let result = parse_npm_publish_payload(&body, "pkg", false);
         assert!(result.is_err());
     }
 
@@ -7280,7 +7480,7 @@ mod tests {
         for (payload, url_name, label) in cases {
             let body = json_to_bytes(&payload);
             assert!(
-                parse_npm_publish_payload(&body, url_name).is_err(),
+                parse_npm_publish_payload(&body, url_name, false).is_err(),
                 "expected error for case: {}",
                 label
             );
@@ -7299,14 +7499,14 @@ mod tests {
             }
         });
         let body = json_to_bytes(&payload);
-        let result = parse_npm_publish_payload(&body, "pkg");
+        let result = parse_npm_publish_payload(&body, "pkg", false);
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_parse_npm_publish_preserves_version_data() {
         let body = make_valid_publish_body("mylib", "2.0.0");
-        let parsed = parse_npm_publish_payload(&body, "mylib").unwrap();
+        let parsed = parse_npm_publish_payload(&body, "mylib", false).unwrap();
         let vd = &parsed.versions[0].version_data;
         assert_eq!(vd["description"], "A test package");
     }
@@ -7332,6 +7532,7 @@ mod tests {
             "1.0.0",
             serde_json::json!({"version": "1.0.0"}),
             &attachments,
+            false,
         )
         .unwrap();
         assert_eq!(ver.version, "1.0.0");
@@ -7344,18 +7545,28 @@ mod tests {
     fn test_extract_version_tarball_scoped() {
         let attachments = make_attachments("core-7.0.0.tgz", b"scoped data");
 
-        let ver =
-            extract_version_tarball("@babel/core", "7.0.0", serde_json::json!({}), &attachments)
-                .unwrap();
+        let ver = extract_version_tarball(
+            "@babel/core",
+            "7.0.0",
+            serde_json::json!({}),
+            &attachments,
+            false,
+        )
+        .unwrap();
         assert_eq!(ver.tarball_filename, "core-7.0.0.tgz");
     }
 
     #[test]
     fn test_extract_version_tarball_falls_back_to_first_attachment() {
         let attachments = make_attachments("different-name.tgz", b"fallback data");
-        assert!(
-            extract_version_tarball("mylib", "1.0.0", serde_json::json!({}), &attachments).is_ok()
-        );
+        assert!(extract_version_tarball(
+            "mylib",
+            "1.0.0",
+            serde_json::json!({}),
+            &attachments,
+            false
+        )
+        .is_ok());
     }
 
     #[test]
@@ -7364,7 +7575,9 @@ mod tests {
 
         // Empty attachments map
         let empty = serde_json::Map::new();
-        assert!(extract_version_tarball("mylib", "1.0.0", version_data.clone(), &empty).is_err());
+        assert!(
+            extract_version_tarball("mylib", "1.0.0", version_data.clone(), &empty, false).is_err()
+        );
 
         // Attachment present but missing the "data" field
         let mut no_data = serde_json::Map::new();
@@ -7372,7 +7585,10 @@ mod tests {
             "mylib-1.0.0.tgz".to_string(),
             serde_json::json!({ "content_type": "application/octet-stream" }),
         );
-        assert!(extract_version_tarball("mylib", "1.0.0", version_data.clone(), &no_data).is_err());
+        assert!(
+            extract_version_tarball("mylib", "1.0.0", version_data.clone(), &no_data, false)
+                .is_err()
+        );
 
         // Attachment has a "data" field with invalid base64
         let mut bad_b64 = serde_json::Map::new();
@@ -7380,7 +7596,7 @@ mod tests {
             "mylib-1.0.0.tgz".to_string(),
             serde_json::json!({ "data": "!!!not-base64!!!" }),
         );
-        assert!(extract_version_tarball("mylib", "1.0.0", version_data, &bad_b64).is_err());
+        assert!(extract_version_tarball("mylib", "1.0.0", version_data, &bad_b64, false).is_err());
     }
 
     #[test]
@@ -7389,11 +7605,52 @@ mod tests {
         let attachments = make_attachments("pkg-1.0.0.tgz", content);
 
         let ver =
-            extract_version_tarball("pkg", "1.0.0", serde_json::json!({}), &attachments).unwrap();
+            extract_version_tarball("pkg", "1.0.0", serde_json::json!({}), &attachments, false)
+                .unwrap();
 
         let mut hasher = Sha256::new();
         hasher.update(content);
         assert_eq!(ver.sha256, format!("{:x}", hasher.finalize()));
+    }
+
+    #[test]
+    fn test_extract_version_tarball_always_computes_sha512_integrity() {
+        let content = b"integrity check content";
+        let attachments = make_attachments("pkg-1.0.0.tgz", content);
+
+        // legacy_metadata=false must still compute the sha512- integrity —
+        // only the extra SHA-1 shasum is gated behind the flag.
+        let ver =
+            extract_version_tarball("pkg", "1.0.0", serde_json::json!({}), &attachments, false)
+                .unwrap();
+
+        assert!(ver.integrity_sha512.starts_with("sha512-"));
+        let mut hasher = sha2::Sha512::new();
+        hasher.update(content);
+        let expected = format!(
+            "sha512-{}",
+            base64::engine::general_purpose::STANDARD.encode(hasher.finalize())
+        );
+        assert_eq!(ver.integrity_sha512, expected);
+        assert!(
+            ver.shasum_sha1.is_none(),
+            "shasum must not be computed when legacy_metadata is off"
+        );
+    }
+
+    #[test]
+    fn test_extract_version_tarball_computes_shasum_when_legacy_metadata_enabled() {
+        let content = b"legacy upm content";
+        let attachments = make_attachments("pkg-1.0.0.tgz", content);
+
+        let ver =
+            extract_version_tarball("pkg", "1.0.0", serde_json::json!({}), &attachments, true)
+                .unwrap();
+
+        let mut hasher = sha1::Sha1::new();
+        hasher.update(content);
+        let expected = format!("{:x}", hasher.finalize());
+        assert_eq!(ver.shasum_sha1, Some(expected));
     }
 
     // -----------------------------------------------------------------------
@@ -7408,6 +7665,8 @@ mod tests {
             tarball_filename: "pkg-3.0.0.tgz".to_string(),
             tarball_bytes: vec![1, 2, 3],
             sha256: "abc".to_string(),
+            integrity_sha512: "sha512-abc".to_string(),
+            shasum_sha1: None,
         };
         assert_eq!(ver.version, "3.0.0");
         assert_eq!(ver.tarball_bytes.len(), 3);
@@ -7431,7 +7690,7 @@ mod tests {
             }
         });
         let body = json_to_bytes(&payload);
-        let parsed = parse_npm_publish_payload(&body, "multi").unwrap();
+        let parsed = parse_npm_publish_payload(&body, "multi", false).unwrap();
         assert_eq!(parsed.versions.len(), 2);
 
         let version_names: Vec<&str> = parsed.versions.iter().map(|v| v.version.as_str()).collect();
@@ -7592,12 +7851,25 @@ mod tests {
         }
     }
 
-    /// Call `build_npm_metadata_response` and return the parsed JSON body.
+    /// Call `build_npm_metadata_response` (legacy metadata mode off, matching
+    /// the default) and return the parsed JSON body.
     async fn metadata_response_json(
         artifacts: &[NpmMetadataArtifact],
         package_name: &str,
         base_url: &str,
         repo_key: &str,
+    ) -> serde_json::Value {
+        metadata_response_json_with_legacy(artifacts, package_name, base_url, repo_key, false).await
+    }
+
+    /// Same as [`metadata_response_json`] but with `legacy_metadata` set
+    /// explicitly, for BUG-003 shasum/integrity tests.
+    async fn metadata_response_json_with_legacy(
+        artifacts: &[NpmMetadataArtifact],
+        package_name: &str,
+        base_url: &str,
+        repo_key: &str,
+        legacy_metadata: bool,
     ) -> serde_json::Value {
         let resp = build_npm_metadata_response(
             artifacts,
@@ -7606,6 +7878,7 @@ mod tests {
             repo_key,
             &serde_json::Map::new(),
             false,
+            legacy_metadata,
         )
         .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -7682,6 +7955,123 @@ mod tests {
             "tarball URL should use virtual repo key, got: {}",
             tarball
         );
+    }
+
+    /// Build an NpmMetadataArtifact carrying a `dist_extra` block, as
+    /// `store_npm_version` writes it at publish time (BUG-003).
+    fn make_artifact_with_dist_extra(
+        path: &str,
+        version: &str,
+        sha256: &str,
+        integrity: &str,
+        shasum: Option<&str>,
+    ) -> NpmMetadataArtifact {
+        NpmMetadataArtifact {
+            path: path.to_string(),
+            version: Some(version.to_string()),
+            checksum_sha256: sha256.to_string(),
+            metadata: Some(serde_json::json!({
+                "dist_extra": {
+                    "integrity": integrity,
+                    "shasum": shasum,
+                }
+            })),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_build_npm_metadata_response_uses_stored_sha512_integrity() {
+        // BUG-003: once a version has a stored `dist_extra.integrity`, it must
+        // be served verbatim instead of the legacy sha256- computation, even
+        // with legacy_metadata off.
+        let artifacts = vec![make_artifact_with_dist_extra(
+            "mylib/1.0.0/mylib-1.0.0.tgz",
+            "1.0.0",
+            SHA256_EMPTY,
+            "sha512-deadbeef==",
+            None,
+        )];
+        let body =
+            metadata_response_json(&artifacts, "mylib", "http://localhost:8080", "npm-hosted")
+                .await;
+        assert_eq!(
+            body["versions"]["1.0.0"]["dist"]["integrity"],
+            "sha512-deadbeef=="
+        );
+        assert!(
+            body["versions"]["1.0.0"]["dist"]["shasum"].is_null(),
+            "shasum must be absent when legacy_metadata is off, regardless of stored dist_extra"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_npm_metadata_response_falls_back_to_sha256_without_dist_extra() {
+        // Artifacts published before this change have no `dist_extra` stored;
+        // they must keep serving the legacy (non-standard) sha256- value
+        // until republished — no retroactive backfill in this change.
+        let artifacts = vec![make_artifact(
+            "mylib/1.0.0/mylib-1.0.0.tgz",
+            "1.0.0",
+            SHA256_EMPTY,
+        )];
+        let body =
+            metadata_response_json(&artifacts, "mylib", "http://localhost:8080", "npm-hosted")
+                .await;
+        assert!(body["versions"]["1.0.0"]["dist"]["integrity"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256-"));
+    }
+
+    #[tokio::test]
+    async fn test_build_npm_metadata_response_includes_shasum_when_legacy_metadata_enabled() {
+        let artifacts = vec![make_artifact_with_dist_extra(
+            "mylib/1.0.0/mylib-1.0.0.tgz",
+            "1.0.0",
+            SHA256_EMPTY,
+            "sha512-deadbeef==",
+            Some("aaaabbbbccccddddeeeeffff0000111122223333"),
+        )];
+        let body = metadata_response_json_with_legacy(
+            &artifacts,
+            "mylib",
+            "http://localhost:8080",
+            "npm-hosted",
+            true,
+        )
+        .await;
+        assert_eq!(
+            body["versions"]["1.0.0"]["dist"]["shasum"],
+            "aaaabbbbccccddddeeeeffff0000111122223333"
+        );
+        assert_eq!(
+            body["versions"]["1.0.0"]["dist"]["integrity"],
+            "sha512-deadbeef=="
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_npm_metadata_response_omits_shasum_when_not_yet_published_with_legacy_mode()
+    {
+        // legacy_metadata is on, but this artifact was published before the
+        // flag was enabled, so no shasum was stored — it must stay absent
+        // rather than erroring or fabricating a value.
+        let artifacts = vec![make_artifact_with_dist_extra(
+            "mylib/1.0.0/mylib-1.0.0.tgz",
+            "1.0.0",
+            SHA256_EMPTY,
+            "sha512-deadbeef==",
+            None,
+        )];
+        let body = metadata_response_json_with_legacy(
+            &artifacts,
+            "mylib",
+            "http://localhost:8080",
+            "npm-hosted",
+            true,
+        )
+        .await;
+        assert!(body["versions"]["1.0.0"]["dist"]["shasum"].is_null());
     }
 
     #[tokio::test]
@@ -7980,6 +8370,7 @@ mod tests {
             "npm-hosted",
             &serde_json::Map::new(),
             false,
+            false,
         )
         .unwrap();
         let resp_scoped = build_npm_metadata_response(
@@ -7988,6 +8379,7 @@ mod tests {
             "http://localhost:8080",
             "npm-hosted",
             &serde_json::Map::new(),
+            false,
             false,
         )
         .unwrap();
@@ -9611,7 +10003,8 @@ mod tests {
             "dist-tags": { "next": "2.0.0-rc.1" }
         });
         let bytes = Bytes::from(serde_json::to_vec(&body).unwrap());
-        let parsed = parse_npm_publish_payload(&bytes, "widget").expect("payload should parse");
+        let parsed =
+            parse_npm_publish_payload(&bytes, "widget", false).expect("payload should parse");
         assert_eq!(
             parsed.dist_tags.get("next").and_then(|v| v.as_str()),
             Some("2.0.0-rc.1")
