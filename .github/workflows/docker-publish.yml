@@ -136,7 +136,7 @@ jobs:
       # used to pre-seed the Grype CVE DB inside Dockerfile.backend) are
       # not subject to the 100-pull/6h anonymous rate limit.
       - name: Log in to Docker Hub (for transitive base-image pulls)
-        if: ${{ secrets.DOCKERHUB_USERNAME != '' }}
+        continue-on-error: true
         uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -228,7 +228,7 @@ jobs:
       # Authenticate to Docker Hub for transitive base-image pulls; see
       # the matching step in build-backend for rationale.
       - name: Log in to Docker Hub (for transitive base-image pulls)
-        if: ${{ secrets.DOCKERHUB_USERNAME != '' }}
+        continue-on-error: true
         uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -309,7 +309,7 @@ jobs:
       # Authenticate to Docker Hub for transitive base-image pulls; see
       # the matching step in build-backend for rationale.
       - name: Log in to Docker Hub (for transitive base-image pulls)
-        if: ${{ secrets.DOCKERHUB_USERNAME != '' }}
+        continue-on-error: true
         uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -735,7 +735,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Log in to Docker Hub
-        if: ${{ secrets.DOCKERHUB_USERNAME != '' }}
+        continue-on-error: true
         uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -879,7 +879,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Log in to Docker Hub
-        if: ${{ secrets.DOCKERHUB_USERNAME != '' }}
+        continue-on-error: true
         uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -1026,7 +1026,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Log in to Docker Hub
-        if: ${{ secrets.DOCKERHUB_USERNAME != '' }}
+        continue-on-error: true
         uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -1251,7 +1251,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Log in to Docker Hub
-        if: ${{ secrets.DOCKERHUB_USERNAME != '' }}
+        continue-on-error: true
         uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
