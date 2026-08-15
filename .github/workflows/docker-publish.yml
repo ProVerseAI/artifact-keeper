@@ -820,6 +820,11 @@ jobs:
           echo "digest=${DIGEST}" >> $GITHUB_OUTPUT
 
       - name: Copy to Docker Hub
+        # Best-effort: docker.io/artifactkeeper/* is upstream's Docker Hub
+        # namespace, not this fork's. A fork will never hold those push
+        # credentials, so a 401 here is expected and must not fail the job --
+        # the GHCR publish above is the actual deliverable.
+        continue-on-error: true
         run: |
           docker buildx imagetools create \
             $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< '${{ steps.meta-dockerhub.outputs.json }}') \
@@ -959,6 +964,11 @@ jobs:
           echo "digest=${DIGEST}" >> $GITHUB_OUTPUT
 
       - name: Copy to Docker Hub
+        # Best-effort: docker.io/artifactkeeper/* is upstream's Docker Hub
+        # namespace, not this fork's. A fork will never hold those push
+        # credentials, so a 401 here is expected and must not fail the job --
+        # the GHCR publish above is the actual deliverable.
+        continue-on-error: true
         run: |
           docker buildx imagetools create \
             $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< '${{ steps.meta-dockerhub.outputs.json }}') \
@@ -1320,6 +1330,11 @@ jobs:
           echo "digest=${DIGEST}" >> $GITHUB_OUTPUT
 
       - name: Copy to Docker Hub
+        # Best-effort: docker.io/artifactkeeper/* is upstream's Docker Hub
+        # namespace, not this fork's. A fork will never hold those push
+        # credentials, so a 401 here is expected and must not fail the job --
+        # the GHCR publish above is the actual deliverable.
+        continue-on-error: true
         run: |
           docker buildx imagetools create \
             $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< '${{ steps.meta-dockerhub.outputs.json }}') \
