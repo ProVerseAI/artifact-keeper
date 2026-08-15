@@ -34,9 +34,9 @@ concurrency:
 
 env:
   REGISTRY: ghcr.io
-  BACKEND_IMAGE: ${{ github.repository }}-backend
-  OPENSCAP_IMAGE: ${{ github.repository }}-openscap
-  SCANNER_ADAPTER_IMAGE: ${{ github.repository }}-scanner-adapter
+  BACKEND_IMAGE: proverseai/artifact-keeper-backend
+  OPENSCAP_IMAGE: proverseai/artifact-keeper-openscap
+  SCANNER_ADAPTER_IMAGE: proverseai/artifact-keeper-scanner-adapter
   DOCKERHUB_BACKEND: artifactkeeper/backend
   DOCKERHUB_OPENSCAP: artifactkeeper/openscap
   DOCKERHUB_SCANNER_ADAPTER: artifactkeeper/scanner-adapter
@@ -1380,9 +1380,9 @@ jobs:
       - name: Probe ghcr.io manifests for expected semver tags
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          BACKEND_IMAGE: ${{ env.BACKEND_IMAGE }}
-          OPENSCAP_IMAGE: ${{ env.OPENSCAP_IMAGE }}
-          SCANNER_ADAPTER_IMAGE: ${{ env.SCANNER_ADAPTER_IMAGE }}
+          BACKEND_IMAGE: proverseai/artifact-keeper-backend
+          OPENSCAP_IMAGE: proverseai/artifact-keeper-openscap
+          SCANNER_ADAPTER_IMAGE: proverseai/artifact-keeper-scanner-adapter
         run: |
           set -u
           VERSION="${GITHUB_REF#refs/tags/v}"
