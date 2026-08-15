@@ -525,6 +525,13 @@ jobs:
           # have no fixed tool release yet (justified per-CVE in .trivyignore).
           trivyignores: '.trivyignore'
           exit-code: '1'
+          # Without this, trivy-action's entrypoint unsets TRIVY_SEVERITY for
+          # SARIF output (so the report shows all severities for code-scanning
+          # UI purposes), which also strips severity filtering from the
+          # exit-code check -- silently gating on ANY unignored finding of ANY
+          # severity, not just CRITICAL/HIGH as documented above and in
+          # .trivyignore. This keeps the severity filter applied to both.
+          limit-severities-for-sarif: true
           skip-setup-trivy: true
 
       - name: Trivy scan - OpenSCAP
@@ -538,6 +545,7 @@ jobs:
           ignore-unfixed: true
           trivyignores: '.trivyignore'
           exit-code: '1'
+          limit-severities-for-sarif: true
           skip-setup-trivy: true
 
       - name: Trivy scan - Scanner Adapter
@@ -551,6 +559,7 @@ jobs:
           ignore-unfixed: true
           trivyignores: '.trivyignore'
           exit-code: '1'
+          limit-severities-for-sarif: true
           skip-setup-trivy: true
 
       # Alpine scan skipped while alpine builds are suspended.
@@ -565,6 +574,7 @@ jobs:
           ignore-unfixed: true
           trivyignores: '.trivyignore'
           exit-code: '1'
+          limit-severities-for-sarif: true
           skip-setup-trivy: true
 
       - name: Upload Backend Trivy SARIF
