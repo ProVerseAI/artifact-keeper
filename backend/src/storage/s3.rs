@@ -40,6 +40,20 @@
 //!   multipart UploadPartCopy in slices of this size. Clamped into
 //!   [5 MiB, 5 GiB]. Lever for S3-compatible stores with lower copy limits.
 //!   `S3_MAX_SINGLE_COPY_SIZE` is honoured as a fallback alias.
+//! - S3_RETRY_TIMEOUT_SECS: Cumulative retry budget, measured from the start
+//!   of the original request, after which a failed request/read is no
+//!   longer retried (default: 3600). object_store's own default is 180s
+//!   (`RetryConfig::default().retry_timeout`, i.e. 3*60s) -- this is the knob
+//!   that actually bounds long-lived single-GET downloads in practice: when
+//!   a read on the response body errors (including on hitting
+//!   S3_BULK_TIMEOUT_SECS), object_store transparently retries with a
+//!   ranged GET and stitches the stream back together, *as long as the
+//!   180s retry budget hasn't elapsed* -- masking the per-request timeout
+//!   until the cumulative budget runs out, at which point the download is
+//!   cut for good. Both knobs must be sized together for large single-blob
+//!   downloads to succeed. Per object_store's own docs, keep this below the
+//!   validity window of any STS/session-token credentials in use, since
+//!   retries reuse the original credentials without renewing them.
 //!
 //! For redirect downloads (302 to presigned URLs):
 //! - S3_REDIRECT_DOWNLOADS: Enable 302 redirects (default: false)
@@ -63,7 +77,7 @@ use futures::{StreamExt, TryStreamExt};
 use object_store::aws::{AmazonS3, AmazonS3Builder, AwsAuthorizer};
 use object_store::multipart::{MultipartStore, PartId};
 use object_store::path::Path as ObjectPath;
-use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
+use object_store::{ObjectStore, ObjectStoreExt, PutPayload, RetryConfig};
 use sha2::{Digest, Sha256};
 use std::time::Duration;
 use tokio::task::JoinSet;
@@ -546,6 +560,14 @@ pub struct S3Config {
     /// single copy may exceed AWS's 5 GiB cap. Default:
     /// [`S3_MAX_SINGLE_COPY_SIZE`] (5 GiB).
     pub max_single_copy_bytes: u64,
+    /// Cumulative retry budget in seconds, measured from the start of the
+    /// original request. object_store retries failed body reads (including
+    /// ones caused by `bulk_timeout_secs` elapsing) with a ranged GET,
+    /// invisibly to the caller, but only while `elapsed <= retry_timeout`.
+    /// object_store defaults this to 180 seconds, which silently caps every
+    /// long-lived single-GET download at ~180s even if `bulk_timeout_secs`
+    /// is raised. Default here: 3600 seconds.
+    pub retry_timeout_secs: u64,
 }
 
 /// CloudFront CDN configuration for signed URLs
@@ -647,6 +669,10 @@ impl S3Config {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(S3_MULTIPART_TARGET_PARTS);
+        let retry_timeout_secs: u64 = std::env::var("S3_RETRY_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3600);
 
         Ok(Self {
             bucket,
@@ -670,6 +696,7 @@ impl S3Config {
             multipart_chunk_size,
             multipart_max_in_flight_parts,
             multipart_target_parts,
+            retry_timeout_secs,
         })
     }
 
@@ -739,6 +766,7 @@ impl S3Config {
             multipart_chunk_size: S3_MULTIPART_CHUNK_SIZE,
             multipart_max_in_flight_parts: S3_MULTIPART_MAX_IN_FLIGHT_PARTS,
             multipart_target_parts: S3_MULTIPART_TARGET_PARTS,
+            retry_timeout_secs: 3600,
         }
     }
 
@@ -828,6 +856,11 @@ impl S3Config {
     /// [`Self::multipart_target_parts`]).
     pub fn with_multipart_target_parts(mut self, target_parts: u64) -> Self {
         self.multipart_target_parts = target_parts;
+        self
+    }
+
+    pub fn with_retry_timeout_secs(mut self, timeout_secs: u64) -> Self {
+        self.retry_timeout_secs = timeout_secs;
         self
     }
 }
@@ -1192,10 +1225,22 @@ impl S3Backend {
         // env vars that could hijack endpoints (AWS_ENDPOINT_URL), disable
         // signing (AWS_SKIP_SIGNATURE), or shadow IAM credentials. We
         // selectively read only the credential chain variables needed.
+        // object_store retries failed body reads (e.g. from the per-attempt
+        // request timeout elapsing on a still-transferring large object)
+        // with a ranged GET, but only within this cumulative budget measured
+        // from the start of the original request. Left at object_store's
+        // default of 180s, this silently caps every long-lived single-GET
+        // download at ~180s regardless of the bulk request timeout above.
+        let retry_config = RetryConfig {
+            retry_timeout: Duration::from_secs(config.retry_timeout_secs),
+            ..Default::default()
+        };
+
         let mut builder = AmazonS3Builder::new()
             .with_bucket_name(&config.bucket)
             .with_region(&config.region)
-            .with_client_options(client_opts);
+            .with_client_options(client_opts)
+            .with_retry(retry_config);
 
         if let Some(endpoint) = &config.endpoint {
             builder = builder.with_endpoint(endpoint);
@@ -3514,6 +3559,61 @@ mod tests {
                 None => std::env::remove_var(v),
             }
         }
+    }
+
+    #[test]
+    fn test_s3_retry_timeout_secs_default_and_override() {
+        let saved = std::env::var("S3_RETRY_TIMEOUT_SECS").ok();
+        let saved_bucket = std::env::var("S3_BUCKET").ok();
+        std::env::set_var("S3_BUCKET", "retry-timeout-test-bucket");
+
+        // Default (no override) is 3600 seconds — object_store's own default
+        // (RetryConfig::default().retry_timeout) is 180s, which is the knob
+        // that actually caps long single-GET downloads in practice; this
+        // default must be large enough to lift that cap.
+        std::env::remove_var("S3_RETRY_TIMEOUT_SECS");
+        let config = S3Config::from_env().expect("from_env should succeed");
+        assert_eq!(config.retry_timeout_secs, 3600);
+        assert_ne!(
+            config.retry_timeout_secs,
+            RetryConfig::default().retry_timeout.as_secs(),
+            "default must override object_store's 180s retry_timeout, not match it"
+        );
+
+        // A valid numeric override is honored.
+        std::env::set_var("S3_RETRY_TIMEOUT_SECS", "900");
+        let config = S3Config::from_env().expect("from_env should succeed");
+        assert_eq!(config.retry_timeout_secs, 900);
+
+        // A non-numeric value falls back to the default.
+        std::env::set_var("S3_RETRY_TIMEOUT_SECS", "not-a-number");
+        let config = S3Config::from_env().expect("from_env should succeed");
+        assert_eq!(config.retry_timeout_secs, 3600);
+
+        match saved {
+            Some(v) => std::env::set_var("S3_RETRY_TIMEOUT_SECS", v),
+            None => std::env::remove_var("S3_RETRY_TIMEOUT_SECS"),
+        }
+        match saved_bucket {
+            Some(v) => std::env::set_var("S3_BUCKET", v),
+            None => std::env::remove_var("S3_BUCKET"),
+        }
+    }
+
+    #[test]
+    fn test_build_store_wires_retry_timeout_from_config() {
+        // build_store must succeed with a custom retry_timeout_secs applied
+        // (i.e. RetryConfig construction + AmazonS3Builder::with_retry don't
+        // error), proving the knob is actually wired through, not just
+        // stored on S3Config unused.
+        let config = S3Config::new("b".to_string(), "us-east-1".to_string(), None, None)
+            .with_retry_timeout_secs(3600);
+        let result = S3Backend::build_store(&config, None, None);
+        assert!(
+            result.is_ok(),
+            "build_store with custom retry_timeout_secs should succeed: {:?}",
+            result.err()
+        );
     }
 
     #[test]
