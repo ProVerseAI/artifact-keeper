@@ -20,6 +20,10 @@
 //! For HTTP connection pool tuning:
 //! - S3_POOL_MAX_IDLE_PER_HOST: Maximum idle connections per host (default: 256)
 //! - S3_POOL_IDLE_TIMEOUT_SECS: Idle connection timeout in seconds (default: 90)
+//! - S3_REQUEST_TIMEOUT_SECS: Per-request timeout, covering the full request
+//!   including body transfer (default: 3600). Downloads use a single GET
+//!   spanning the whole object body, so this must be generous enough to
+//!   cover large single-blob transfers (object_store's own default is 30s).
 //!
 //! For redirect downloads (302 to presigned URLs):
 //! - S3_REDIRECT_DOWNLOADS: Enable 302 redirects (default: false)
@@ -401,6 +405,13 @@ pub struct S3Config {
     /// longer than this are closed. Default: 90 seconds (matches hyper/reqwest
     /// defaults).
     pub pool_idle_timeout_secs: u64,
+    /// Per-request timeout in seconds, applied by object_store/reqwest from
+    /// when the request starts connecting until the response body has fully
+    /// been received. object_store defaults this to 30 seconds, which is far
+    /// too short for a single-GET download of a large blob (downloads are one
+    /// request; uploads are chunked into short multipart requests and are not
+    /// affected). Default here: 3600 seconds.
+    pub request_timeout_secs: u64,
 }
 
 /// CloudFront CDN configuration for signed URLs
@@ -457,6 +468,10 @@ impl S3Config {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(90);
+        let request_timeout_secs: u64 = std::env::var("S3_REQUEST_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3600);
 
         Ok(Self {
             bucket,
@@ -474,6 +489,7 @@ impl S3Config {
             disable_multi_delete,
             pool_max_idle_per_host,
             pool_idle_timeout_secs,
+            request_timeout_secs,
         })
     }
 
@@ -537,6 +553,7 @@ impl S3Config {
             disable_multi_delete: false,
             pool_max_idle_per_host: 256,
             pool_idle_timeout_secs: 90,
+            request_timeout_secs: 3600,
         }
     }
 
@@ -586,6 +603,11 @@ impl S3Config {
 
     pub fn with_pool_idle_timeout_secs(mut self, timeout_secs: u64) -> Self {
         self.pool_idle_timeout_secs = timeout_secs;
+        self
+    }
+
+    pub fn with_request_timeout_secs(mut self, timeout_secs: u64) -> Self {
+        self.request_timeout_secs = timeout_secs;
         self
     }
 }
@@ -745,7 +767,8 @@ impl S3Backend {
     ) -> Result<AmazonS3> {
         let mut client_opts = object_store::ClientOptions::new()
             .with_pool_max_idle_per_host(config.pool_max_idle_per_host)
-            .with_pool_idle_timeout(Duration::from_secs(config.pool_idle_timeout_secs));
+            .with_pool_idle_timeout(Duration::from_secs(config.pool_idle_timeout_secs))
+            .with_timeout(Duration::from_secs(config.request_timeout_secs));
 
         if config
             .endpoint
@@ -2496,6 +2519,38 @@ mod tests {
         restore("S3_INSECURE_TLS", orig_insecure);
         restore("S3_DISABLE_MULTI_DELETE", orig_disable_multi);
         restore("CLOUDFRONT_DISTRIBUTION_URL", orig_cf_url);
+    }
+
+    #[test]
+    fn test_s3_request_timeout_secs_default_and_override() {
+        let saved = std::env::var("S3_REQUEST_TIMEOUT_SECS").ok();
+        // S3_BUCKET must be set for from_env() to succeed; save/restore it too.
+        let saved_bucket = std::env::var("S3_BUCKET").ok();
+        std::env::set_var("S3_BUCKET", "request-timeout-test-bucket");
+
+        // Default (no override) is 3600 seconds.
+        std::env::remove_var("S3_REQUEST_TIMEOUT_SECS");
+        let config = S3Config::from_env().expect("from_env should succeed");
+        assert_eq!(config.request_timeout_secs, 3600);
+
+        // A valid numeric override is honored.
+        std::env::set_var("S3_REQUEST_TIMEOUT_SECS", "60");
+        let config = S3Config::from_env().expect("from_env should succeed");
+        assert_eq!(config.request_timeout_secs, 60);
+
+        // A non-numeric value falls back to the default.
+        std::env::set_var("S3_REQUEST_TIMEOUT_SECS", "not-a-number");
+        let config = S3Config::from_env().expect("from_env should succeed");
+        assert_eq!(config.request_timeout_secs, 3600);
+
+        match saved {
+            Some(v) => std::env::set_var("S3_REQUEST_TIMEOUT_SECS", v),
+            None => std::env::remove_var("S3_REQUEST_TIMEOUT_SECS"),
+        }
+        match saved_bucket {
+            Some(v) => std::env::set_var("S3_BUCKET", v),
+            None => std::env::remove_var("S3_BUCKET"),
+        }
     }
 
     #[test]
