@@ -32,7 +32,9 @@
 //!   object payload reads/writes, multipart part uploads, and server-side
 //!   CopyObject (default: 1800). Control-plane calls (head/list/delete/exists)
 //!   keep a short [`S3_CONTROL_TIMEOUT`] so a wedged endpoint still fails fast.
-//!   Set to 0 to disable the bulk timeout entirely.
+//!   Set to 0 to disable the bulk timeout entirely. `S3_REQUEST_TIMEOUT_SECS`
+//!   (the name an earlier ProVerse build used for the same whole-request
+//!   timeout on downloads) is honoured as a fallback alias.
 //! - S3_MAX_SINGLE_COPY_BYTES: Largest object copied with one server-side
 //!   CopyObject (default: 5 GiB, AWS's cap). Larger sources are copied via
 //!   multipart UploadPartCopy in slices of this size. Clamped into
@@ -611,7 +613,12 @@ impl S3Config {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(90);
+        // `S3_REQUEST_TIMEOUT_SECS` is the name an earlier ProVerse build used
+        // for the whole-request timeout that governs single-GET downloads of
+        // multi-GB blobs; honour it as a fallback so existing deployments keep
+        // their setting. `S3_BULK_TIMEOUT_SECS` wins when both are set.
         let bulk_timeout_secs: u64 = std::env::var("S3_BULK_TIMEOUT_SECS")
+            .or_else(|_| std::env::var("S3_REQUEST_TIMEOUT_SECS"))
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(S3_DEFAULT_BULK_TIMEOUT_SECS);
@@ -3465,6 +3472,48 @@ mod tests {
         restore("S3_INSECURE_TLS", orig_insecure);
         restore("S3_DISABLE_MULTI_DELETE", orig_disable_multi);
         restore("CLOUDFRONT_DISTRIBUTION_URL", orig_cf_url);
+    }
+
+    #[test]
+    fn test_s3_request_timeout_secs_is_a_fallback_alias_for_bulk_timeout() {
+        let vars = [
+            "S3_REQUEST_TIMEOUT_SECS",
+            "S3_BULK_TIMEOUT_SECS",
+            "S3_BUCKET",
+        ];
+        let saved: Vec<Option<String>> = vars.iter().map(|v| std::env::var(v).ok()).collect();
+        for v in &vars {
+            std::env::remove_var(v);
+        }
+        // S3_BUCKET must be set for from_env() to succeed.
+        std::env::set_var("S3_BUCKET", "request-timeout-test-bucket");
+
+        // Neither set: the bulk default applies.
+        let config = S3Config::from_env().expect("from_env should succeed");
+        assert_eq!(config.bulk_timeout_secs, S3_DEFAULT_BULK_TIMEOUT_SECS);
+
+        // The legacy name alone drives the bulk-transfer timeout.
+        std::env::set_var("S3_REQUEST_TIMEOUT_SECS", "60");
+        let config = S3Config::from_env().expect("from_env should succeed");
+        assert_eq!(config.bulk_timeout_secs, 60);
+
+        // The canonical name wins when both are set.
+        std::env::set_var("S3_BULK_TIMEOUT_SECS", "120");
+        let config = S3Config::from_env().expect("from_env should succeed");
+        assert_eq!(config.bulk_timeout_secs, 120);
+
+        // A non-numeric value falls back to the default.
+        std::env::remove_var("S3_BULK_TIMEOUT_SECS");
+        std::env::set_var("S3_REQUEST_TIMEOUT_SECS", "not-a-number");
+        let config = S3Config::from_env().expect("from_env should succeed");
+        assert_eq!(config.bulk_timeout_secs, S3_DEFAULT_BULK_TIMEOUT_SECS);
+
+        for (v, s) in vars.iter().zip(saved) {
+            match s {
+                Some(val) => std::env::set_var(v, val),
+                None => std::env::remove_var(v),
+            }
+        }
     }
 
     #[test]
