@@ -98,3 +98,16 @@ GHSA-vh4v-2xq2-g5cg
 # attestation verification, not exercised by AK's adapter scan flow.
 CVE-2026-49834
 CVE-2026-49835
+
+# ---------------------------------------------------------------------------
+# BUG-003 (2026-08-20, architect-approved): golang.org/x/mod v0.38.0 (HIGH,
+# CVSS 8.0; fixed in x/mod 0.40.0), located in the bundled grype scanner
+# binary usr/local/bin/grype (Dockerfile.backend pins ghcr.io/anchore/grype
+# :v0.116.0) — NOT backend code or its dep tree. Not bump-fixable: no grype
+# release consumes x/mod >= 0.40.0 as of grype v0.117.0 (verified upstream
+# go.mod). grype is a bundled scanner tool, not the backend request-path
+# attack surface. Consistent with the existing grype/trivy-embedded exception
+# class above. Removal trigger tracked: proverse-devops/labs BUG-016 (drop
+# these + bump grype the moment a grype release ships x/mod >= 0.40.0).
+CVE-2026-56864
+CVE-2026-56865
