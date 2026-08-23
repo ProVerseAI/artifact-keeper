@@ -2458,14 +2458,14 @@ where
     let had_members = !members.is_empty();
     let members = authorize_virtual_members(db, auth, virtual_repo_id, members).await;
     if had_members && members.is_empty() {
-        // Do NOT fall through to the "has no members" message: that would
-        // distinguish "this virtual is empty" from "this virtual has members
-        // you may not see", an existence oracle over private repositories.
-        return Err((
-            StatusCode::NOT_FOUND,
-            "Artifact not found in any member repository",
-        )
-            .into_response());
+        // Do NOT fall through to a DIFFERENT message: that would distinguish
+        // "this virtual is empty" from "this virtual has members you may not
+        // see", an existence oracle over private repositories. Both arms now
+        // answer `no_accessible_members_response`, which is what makes that
+        // property hold — this arm used to say "Artifact not found in any
+        // member repository" while the empty arm below said "Virtual repository
+        // has no members", so the two stayed distinguishable (#3452).
+        return Err(no_accessible_members_response());
     }
     resolve_virtual_download_from_members(members, proxy_service, path, local_fetch).await
 }
@@ -2495,7 +2495,7 @@ where
     Fut: std::future::Future<Output = Result<StreamingFetchResult, Response>>,
 {
     if members.is_empty() {
-        return Err((StatusCode::NOT_FOUND, "Virtual repository has no members").into_response());
+        return Err(no_accessible_members_response());
     }
 
     // Two-phase, priority-preserving resolution (#2069). Pass 1 (the `probe`
@@ -2572,11 +2572,7 @@ where
     match outcome {
         Some(MemberResolveOutcome::Hit(result)) => Ok(result),
         Some(MemberResolveOutcome::Quarantine(response)) => Err(response),
-        _ => Err((
-            StatusCode::NOT_FOUND,
-            "Artifact not found in any member repository",
-        )
-            .into_response()),
+        _ => Err(member_miss_response()),
     }
 }
 
@@ -2665,7 +2661,7 @@ where
     let members = fetch_virtual_members(&state.db, virtual_repo_id).await?;
 
     if members.is_empty() {
-        return Err((StatusCode::NOT_FOUND, "Virtual repository has no members").into_response());
+        return Err(no_accessible_members_response());
     }
 
     // #3178: narrow to the members this caller may read BEFORE any member is
@@ -2673,11 +2669,7 @@ where
     // download` for why it must not be distinguishable from a genuine miss.
     let members = authorize_virtual_members(&state.db, auth, virtual_repo_id, members).await;
     if members.is_empty() {
-        return Err((
-            StatusCode::NOT_FOUND,
-            "Artifact not found in any member repository",
-        )
-            .into_response());
+        return Err(no_accessible_members_response());
     }
 
     // Two-phase, priority-preserving resolution (#2069), streaming sibling of
@@ -2792,11 +2784,7 @@ where
             Ok(response)
         }
         Some(MemberResolveOutcome::Quarantine(response)) => Err(response),
-        _ => Err((
-            StatusCode::NOT_FOUND,
-            "Artifact not found in any member repository",
-        )
-            .into_response()),
+        _ => Err(member_miss_response()),
     }
 }
 
@@ -2848,7 +2836,7 @@ where
     let members = authorized_virtual_members(db, auth, virtual_repo_id).await?;
 
     if members.is_empty() {
-        return Err((StatusCode::NOT_FOUND, "Virtual repository has no members").into_response());
+        return Err(no_accessible_members_response());
     }
 
     // Two-phase, priority-preserving first-match resolution (#2069). Metadata is
@@ -3360,6 +3348,7 @@ pub async fn try_authorize_virtual_members(
     if members.is_empty() {
         return Ok(members);
     }
+    let member_count = members.len();
     let member_ids: Vec<Uuid> = members.iter().map(|m| m.id).collect();
     let granted: std::collections::HashSet<Uuid> =
         match crate::services::repository_service::RepositoryService::new(db.clone())
@@ -3397,12 +3386,22 @@ pub async fn try_authorize_virtual_members(
     let Some(principal) = auth else {
         // Anonymous: the grant half already reduced to `is_public`, so every
         // surviving member is public and the read baseline applies.
-        return Ok(tenant_admitted);
+        return Ok(log_narrowed(
+            virtual_repo_id,
+            auth,
+            member_count,
+            tenant_admitted,
+        ));
     };
     if principal.is_admin {
         // A global admin satisfies the action for every repository; skip the
         // per-member round trips rather than asking a question with one answer.
-        return Ok(tenant_admitted);
+        return Ok(log_narrowed(
+            virtual_repo_id,
+            auth,
+            member_count,
+            tenant_admitted,
+        ));
     }
 
     // The checks are independent single-row reads, so they are issued together
@@ -3446,11 +3445,71 @@ pub async fn try_authorize_virtual_members(
         }
     }))
     .await;
-    Ok(tenant_admitted
-        .into_iter()
-        .zip(decisions)
-        .filter_map(|(member, ok)| ok.then_some(member))
-        .collect())
+    Ok(log_narrowed(
+        virtual_repo_id,
+        auth,
+        member_count,
+        tenant_admitted
+            .into_iter()
+            .zip(decisions)
+            .filter_map(|(member, ok)| ok.then_some(member))
+            .collect(),
+    ))
+}
+
+/// Record, in the SERVER LOG only, that caller authorization removed members
+/// from a virtual walk — the operator-facing half of #3452.
+///
+/// Every caller collapses a fully-filtered member set into the same not-found
+/// the genuinely-empty set produces, deliberately, so the response is not an
+/// existence oracle over private repositories (see
+/// [`NO_ACCESSIBLE_MEMBERS_MSG`]). The cost of that collapse was that an
+/// operator had no way to tell the two apart EITHER: one reporter re-checked
+/// the members through the admin API, found them configured exactly as
+/// expected, and filed a member-resolution bug against a working resolver.
+/// This is the one place that knows both numbers, so it is where the
+/// distinction is recorded — at `info`, once per walk, and only when the filter
+/// actually removed something, so a fully-authorized walk stays silent.
+///
+/// Returns `admitted` unchanged so the three return sites in
+/// [`try_authorize_virtual_members`] (anonymous, admin, and the per-member
+/// action fan-out) can each wrap their result without repeating the call.
+fn log_narrowed(
+    virtual_repo_id: Uuid,
+    auth: Option<&crate::api::middleware::auth::AuthExtension>,
+    member_count: usize,
+    admitted: Vec<Repository>,
+) -> Vec<Repository> {
+    if admitted.len() < member_count {
+        // Level depends on the PRINCIPAL, not on the outcome. An authenticated
+        // caller is the diagnostic case an operator needs at default verbosity,
+        // and the volume is bounded by who holds a credential. The ANONYMOUS
+        // arm is reached by any unauthenticated GET to a public virtual that
+        // lists a private member, which is 1:1 with request volume and emitted
+        // nothing extra before this change — logging that at `info` turns a
+        // public read path into unsampled log amplification, so it goes to
+        // `debug`. The message and fields are identical either way.
+        let message = "virtual member walk narrowed by caller authorization; members the caller \
+                       holds no read grant on (or that a repository-scoped token's ceiling \
+                       excludes) are dropped";
+        match auth {
+            Some(principal) => tracing::info!(
+                virtual_repo_id = %virtual_repo_id,
+                user_id = %principal.user_id,
+                members_total = member_count,
+                members_accessible = admitted.len(),
+                message
+            ),
+            None => tracing::debug!(
+                virtual_repo_id = %virtual_repo_id,
+                user_id = tracing::field::Empty,
+                members_total = member_count,
+                members_accessible = admitted.len(),
+                message
+            ),
+        }
+    }
+    admitted
 }
 
 /// Fetch a virtual repository's members already narrowed to the ones the
@@ -3484,6 +3543,89 @@ pub async fn authorized_virtual_members(
 ) -> Result<Vec<Repository>, Response> {
     let members = fetch_virtual_members(db, virtual_repo_id).await?;
     try_authorize_virtual_members(db, auth, virtual_repo_id, members).await
+}
+
+/// The ONE 404 body every virtual-repository member walk answers with when it
+/// resolves to zero usable members (#3452).
+///
+/// Two conditions reach this, and they MUST stay indistinguishable on the wire:
+///
+/// 1. the virtual genuinely has no `virtual_repo_members` rows; and
+/// 2. it has members, but [`try_authorize_virtual_members`] dropped every one
+///    of them — the caller holds no read grant on any member, or a
+///    repository-scoped token's ceiling does not carry them.
+///
+/// Emitting different bodies for (1) and (2) is an existence oracle over
+/// private repositories: it tells an unprivileged caller "this virtual
+/// aggregates at least one repository you may not see". `resolve_virtual_
+/// download` already carried a comment saying so, but only closed the oracle
+/// from ONE side — its authorization-filtered arm said "Artifact not found in
+/// any member repository" while the genuinely-empty arm, reached through
+/// [`resolve_virtual_download_from_members`], still said "Virtual repository
+/// has no members". The pair remained distinguishable, so the property the
+/// comment claimed was never actually held. One constant holds it for the
+/// RESPONSE BODY by construction.
+///
+/// Scope of that claim, stated because "by construction" invites a stronger
+/// reading than it deserves: this makes the status, headers and bytes
+/// identical. It does not make the two arms indistinguishable by TIMING — the
+/// filtered arm does strictly more work (`fetch_virtual_members` ->
+/// `filter_visible_repo_ids` -> a per-member `check_repository_action`) than
+/// the empty arm, which early-returns at the `members.is_empty()` guard in
+/// `try_authorize_virtual_members`. Measured at ~2x median (roughly 3 ms vs
+/// 2 ms over 120 samples), with disjoint quartiles. That side channel is
+/// structural and pre-existing — closing it means doing the filter work for a
+/// virtual with no members — so it is not addressed here, only recorded so the
+/// property is not over-claimed.
+///
+/// The wording is the second half of #3452. `"Virtual repository has no
+/// members"` is not merely inconsistent, it is actively misdiagnosing: it names
+/// a *configuration* fault, so an operator whose members are plainly configured
+/// re-checks them through the admin API, finds them present, and concludes the
+/// member resolver is broken. "no ACCESSIBLE members" is true under both
+/// conditions, is the same string under both, and points at the authorization
+/// decision that actually produced it. The distinguishing detail belongs in the
+/// server log — [`try_authorize_virtual_members`] emits it — not in the body.
+pub const NO_ACCESSIBLE_MEMBERS_MSG: &str = "Virtual repository has no accessible members";
+
+/// [`NO_ACCESSIBLE_MEMBERS_MSG`] as the response every one of these paths
+/// returns.
+///
+/// Built from `AppError::NotFound` rather than a bare
+/// `(StatusCode::NOT_FOUND, msg)` tuple so the body is the project's JSON error
+/// envelope (`{"code":"NOT_FOUND","message":…}`) on EVERY format. The tuple
+/// form renders `text/plain`, which is how one caller could observe maven
+/// answer `text/plain` 33 bytes and npm/pypi answer `application/json` 66 bytes
+/// for the same repository, the same principal and the same authorization
+/// outcome (#3452's per-format divergence). A format client that parses an
+/// error body should not have to special-case which AK route it asked.
+pub fn no_accessible_members_response() -> Response {
+    crate::error::AppError::NotFound(NO_ACCESSIBLE_MEMBERS_MSG.to_string()).into_response()
+}
+
+/// The 404 body for a virtual walk that DID have members the caller may read
+/// and simply did not find the artifact in any of them.
+///
+/// Distinct from [`NO_ACCESSIBLE_MEMBERS_MSG`] on purpose, and safely so: a
+/// caller who sees this has already learned that at least one member is visible
+/// to it, which it can equally learn by listing. The dangerous distinction is
+/// *within* the zero-visible-members case, and that one is collapsed.
+///
+/// Exists as a helper for the same reason its sibling does: four call sites
+/// (`cargo`, `pypi`, and two in `repositories`) already emitted this exact text
+/// through `AppError::NotFound` — i.e. the JSON error envelope — while the two
+/// `proxy_helpers` primitives that maven's download path funnels into emitted
+/// it as a bare `(StatusCode, &str)` tuple, which renders `text/plain`. So the
+/// same message, for the same condition, came back as `application/json` on
+/// pypi and `text/plain` on maven. That is the per-format divergence #3452
+/// reported, surviving in the miss case after the zero-members case was
+/// unified; a client should not have to special-case which AK route it asked.
+pub const MEMBER_MISS_MSG: &str = "Artifact not found in any member repository";
+
+/// [`MEMBER_MISS_MSG`] in the JSON error envelope every other emitter of this
+/// text already used.
+pub fn member_miss_response() -> Response {
+    crate::error::AppError::NotFound(MEMBER_MISS_MSG.to_string()).into_response()
 }
 
 /// True when any member of a virtual repository is NOT public (#3323).
@@ -13686,6 +13828,237 @@ mod tests {
             allowed_repo_ids: crate::models::access_scope::AccessScope::Admin,
             iat_ms: None,
         }
+    }
+
+    /// Verified-bug regression for #3452 (with #3387 / #3386).
+    ///
+    /// A virtual member walk that resolves to ZERO usable members has two
+    /// causes, and both must produce the SAME response. Before this fix they
+    /// did not, and the divergence was visible three ways at once:
+    ///
+    /// | condition | body (pre-fix) | content-type |
+    /// |---|---|---|
+    /// | virtual has no member rows | `Virtual repository has no members` | `text/plain` (maven) |
+    /// | every member filtered by authz | `Artifact not found in any member repository` | `text/plain` |
+    /// | same, via the metadata primitive | `Virtual repository has no members` | `application/json` |
+    ///
+    /// The adjacent "members were visible, the artifact simply was not there"
+    /// case keeps its own distinct message (`MEMBER_MISS_MSG`) — a caller that
+    /// reaches it has already learned a member is visible to it — but it, too,
+    /// now renders as the JSON envelope on every format rather than
+    /// `text/plain` on maven and JSON on pypi.
+    ///
+    /// Two properties were broken by that:
+    ///
+    /// 1. **The existence oracle `resolve_virtual_download`'s own comment
+    ///    claims to close was open.** The comment says the filtered arm must
+    ///    not be distinguishable from "this virtual is empty" — but it only
+    ///    changed the FILTERED arm, leaving the empty arm (reached through
+    ///    `resolve_virtual_download_from_members`) saying something else. A
+    ///    caller could still tell "this virtual aggregates at least one
+    ///    repository I may not see" from "this virtual is empty".
+    /// 2. **The message misdiagnosed.** "has no members" names a
+    ///    *configuration* fault, so an operator whose members are configured
+    ///    correctly re-checks them, finds them present, and files a
+    ///    member-resolution bug against a working resolver.
+    ///
+    /// Both reported principals are exercised against the same fixture:
+    ///
+    ///   * (a) a user holding a `read` grant on the virtual PARENT only;
+    ///   * (b) a repository-scoped token holding grants on parent AND member
+    ///     but whose ceiling carries only the parent.
+    ///
+    /// Neither may read the member, so both must see exactly what a caller of
+    /// a genuinely empty virtual sees.
+    ///
+    /// The POSITIVE CONTROL is load-bearing: a "fix" that made every virtual
+    /// answer this body unconditionally would satisfy every equality assertion
+    /// above. The control grants the caller `read` on the member with an
+    /// unrestricted ceiling and asserts the walk gets PAST the gate — it
+    /// reaches the member and misses on content, which is a DIFFERENT response.
+    #[tokio::test]
+    async fn test_3452_zero_accessible_members_is_one_indistinguishable_response() {
+        use crate::api::handlers::test_db_helpers as tdh3452;
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+
+        // Two real virtual repositories: one with no members at all, one whose
+        // single member is a private repository. Real rows, because both the
+        // membership fetch and the grant half are evaluated in SQL.
+        let (empty_virtual_id, _ek, empty_dir) =
+            db_helpers::create_repo(&pool, "virtual", "maven").await;
+        let (parent_id, _pk, parent_dir) = db_helpers::create_repo(&pool, "virtual", "maven").await;
+        let (member_id, _mk, member_dir) = db_helpers::create_repo(&pool, "local", "maven").await;
+        tdh3452::link_virtual_member(&pool, parent_id, member_id, 1).await;
+
+        let (user_id, _un) = tdh3452::create_user(&pool).await;
+        // (a) granted on the PARENT only.
+        tdh3452::grant_repo_actions(&pool, parent_id, user_id, &["read"]).await;
+        let parent_only = nonadmin_auth(user_id);
+
+        // (b) granted on BOTH, but the token ceiling carries only the parent,
+        //     so the member is out of scope. Same denial, different half of
+        //     `require_visible`.
+        let (scoped_user_id, _sn) = tdh3452::create_user(&pool).await;
+        tdh3452::grant_repo_actions(&pool, parent_id, scoped_user_id, &["read"]).await;
+        tdh3452::grant_repo_actions(&pool, member_id, scoped_user_id, &["read"]).await;
+        let parent_scoped_token = crate::api::middleware::auth::AuthExtension {
+            is_api_token: true,
+            allowed_repo_ids: crate::models::access_scope::AccessScope::Restricted(vec![parent_id]),
+            ..nonadmin_auth(scoped_user_id)
+        };
+
+        // `local_fetch` is never invoked on the paths under test (they return
+        // before any member is probed); on the positive control it IS invoked
+        // and reports a miss, which is what makes the control's response
+        // distinguishable from a gate refusal.
+        let never_serves = |_id: Uuid, _loc: crate::storage::registry::StorageLocation| async {
+            Err::<StreamingFetchResult, Response>(
+                (StatusCode::NOT_FOUND, "member has no such artifact").into_response(),
+            )
+        };
+        async fn describe(
+            r: Result<StreamingFetchResult, Response>,
+        ) -> (StatusCode, Option<String>, String) {
+            let resp = match r {
+                Ok(_) => panic!("no member can serve in this fixture"),
+                Err(resp) => resp,
+            };
+            let status = resp.status();
+            let ct = resp
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+            let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                .await
+                .expect("read body");
+            (status, ct, String::from_utf8_lossy(&body).into_owned())
+        }
+
+        let genuinely_empty = describe(
+            resolve_virtual_download(&pool, None, None, empty_virtual_id, "a/b/c", never_serves)
+                .await,
+        )
+        .await;
+        let filtered_parent_grant = describe(
+            resolve_virtual_download(
+                &pool,
+                Some(&parent_only),
+                None,
+                parent_id,
+                "a/b/c",
+                never_serves,
+            )
+            .await,
+        )
+        .await;
+        let filtered_token_scope = describe(
+            resolve_virtual_download(
+                &pool,
+                Some(&parent_scoped_token),
+                None,
+                parent_id,
+                "a/b/c",
+                never_serves,
+            )
+            .await,
+        )
+        .await;
+
+        // The metadata primitive is the other family of format callers (npm
+        // packument, composer, cargo sparse index, pypi simple index) and used
+        // to answer with its own third wording.
+        let metadata_filtered = {
+            let r = resolve_virtual_metadata(
+                &pool,
+                Some(&parent_only),
+                None,
+                parent_id,
+                "a/b/c",
+                |_b, _ct, _ce, _u| async {
+                    Err::<Response, Response>(
+                        (StatusCode::NOT_FOUND, "no metadata").into_response(),
+                    )
+                },
+            )
+            .await;
+            let resp = r.expect_err("no member can serve metadata in this fixture");
+            let status = resp.status();
+            let ct = resp
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+            let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                .await
+                .expect("read body");
+            (status, ct, String::from_utf8_lossy(&body).into_owned())
+        };
+
+        // POSITIVE CONTROL, before any cleanup: a caller who MAY read the
+        // member gets past the gate and reaches the member.
+        let (allowed_user_id, _an) = tdh3452::create_user(&pool).await;
+        tdh3452::grant_repo_actions(&pool, member_id, allowed_user_id, &["read"]).await;
+        let allowed = nonadmin_auth(allowed_user_id);
+        let walked = describe(
+            resolve_virtual_download(
+                &pool,
+                Some(&allowed),
+                None,
+                parent_id,
+                "a/b/c",
+                never_serves,
+            )
+            .await,
+        )
+        .await;
+
+        tdh3452::cleanup_member_repo(&pool, member_id, &member_dir).await;
+        for (id, dir) in [(empty_virtual_id, &empty_dir), (parent_id, &parent_dir)] {
+            tdh3452::cleanup_member_repo(&pool, id, dir).await;
+        }
+        for id in [user_id, scoped_user_id, allowed_user_id] {
+            tdh3452::cleanup_user(&pool, id).await;
+        }
+
+        let expected = (
+            StatusCode::NOT_FOUND,
+            Some("application/json".to_string()),
+            format!(
+                "{{\"code\":\"NOT_FOUND\",\"message\":\"{}\"}}",
+                NO_ACCESSIBLE_MEMBERS_MSG
+            ),
+        );
+        assert_eq!(
+            genuinely_empty, expected,
+            "a virtual with no member rows must answer the shared no-accessible-members body \
+             in the JSON error envelope"
+        );
+        assert_eq!(
+            filtered_parent_grant, genuinely_empty,
+            "#3452 (a): a caller granted on the PARENT only must not be able to tell that this \
+             virtual aggregates a member it may not see -- the response must be byte-identical \
+             to the genuinely-empty one"
+        );
+        assert_eq!(
+            filtered_token_scope, genuinely_empty,
+            "#3452 (b): a repository-scoped token whose ceiling excludes the member must get the \
+             same response as (a) and as the empty virtual"
+        );
+        assert_eq!(
+            metadata_filtered, genuinely_empty,
+            "#3452: the metadata primitive (npm/composer/cargo/pypi) must answer with the same \
+             body and content-type as the download primitive (maven); the per-format divergence \
+             is the reported defect"
+        );
+        assert_ne!(
+            walked.2, genuinely_empty.2,
+            "POSITIVE CONTROL: a caller who MAY read the member must get PAST the member gate. \
+             If this equals the refusal body, the walk is refusing everyone and every equality \
+             above is vacuous"
+        );
     }
 
     /// Verified-bug regression for #1804, CORRECTED by #3178.
