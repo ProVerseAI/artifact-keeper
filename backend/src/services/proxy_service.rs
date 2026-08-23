@@ -507,7 +507,15 @@ const TEE_MAX_CHUNK_BYTES: usize = 64 * 1024;
 /// just fail and degrade like a rejected write). Filesystem-backed
 /// deployments have no equivalent lifecycle mechanism and need a cron/
 /// tmpwatch-style sweep instead.
+/// Kept in lockstep with [`crate::storage::BUCKET_ROOT_KEY_NAMESPACES`]: the
+/// staging objects are written by the prefix-less proxy-cache handle, so the
+/// storage layer must know this namespace is anchored at the bucket root or a
+/// prefixed deployment resolves the same key to two different objects (#3368).
+/// `assert_bucket_root_namespaces_cover_proxy_cache_keys` pins the pairing.
 const TEE_STAGING_KEY_PREFIX: &str = "proxy-cache-staging/";
+
+/// Root of the proxy cache's own key space. Also a bucket-root namespace.
+const PROXY_CACHE_KEY_PREFIX: &str = "proxy-cache/";
 
 /// Default TTL for APT InRelease/Release index files (5 minutes).
 /// Controls how often the proxy re-checks upstream for changes.
@@ -1113,7 +1121,7 @@ struct RegistryTokenResponse {
 /// a malformed input. Used by `record_proxy_cache_lookup` callsites.
 fn repo_key_from_cache_key(cache_key: &str) -> &str {
     cache_key
-        .strip_prefix("proxy-cache/")
+        .strip_prefix(PROXY_CACHE_KEY_PREFIX)
         .and_then(|s| s.split('/').next())
         .filter(|s| !s.is_empty())
         .unwrap_or("unknown")
@@ -1190,8 +1198,17 @@ impl CacheKeys {
     /// individually: same validation order, same error values, same key format.
     pub(crate) fn derive(repo_key: &str, path: &str) -> Result<CacheKeys> {
         let trimmed = ProxyService::validate_cache_path(path)?;
-        let content = format!("proxy-cache/{}/{}/__content__", repo_key, trimmed);
-        let metadata = format!("proxy-cache/{}/{}/__cache_meta__.json", repo_key, trimmed);
+        // Built from the constant, not a literal, so the namespace declared in
+        // `BUCKET_ROOT_KEY_NAMESPACES` and the namespace actually written are
+        // one string (#3368).
+        let content = format!(
+            "{PROXY_CACHE_KEY_PREFIX}{}/{}/__content__",
+            repo_key, trimmed
+        );
+        let metadata = format!(
+            "{PROXY_CACHE_KEY_PREFIX}{}/{}/__cache_meta__.json",
+            repo_key, trimmed
+        );
         ProxyService::check_cache_key_length(repo_key, trimmed)?;
         Ok(CacheKeys { content, metadata })
     }
@@ -5108,7 +5125,7 @@ impl ProxyService {
     fn release_epoch_key(repo_key: &str, distribution: &str) -> Result<String> {
         let validated = Self::validate_cache_path(distribution)?;
         Ok(format!(
-            "proxy-cache/{}/dists/{}/__release_epoch__.json",
+            "{PROXY_CACHE_KEY_PREFIX}{}/dists/{}/__release_epoch__.json",
             repo_key, validated
         ))
     }
@@ -5212,7 +5229,7 @@ impl ProxyService {
     /// (B8). Falls back to an empty list when the storage backend cannot list
     /// the prefix.
     pub async fn list_cached_pypi_packages(&self, repo_key: &str) -> Vec<String> {
-        let prefix = format!("proxy-cache/{}/simple/", repo_key);
+        let prefix = format!("{PROXY_CACHE_KEY_PREFIX}{}/simple/", repo_key);
         let keys = match self.storage.list(Some(&prefix)).await {
             Ok(keys) => keys,
             Err(e) => {
@@ -5241,7 +5258,7 @@ impl ProxyService {
     where
         I: IntoIterator<Item = &'a str>,
     {
-        let simple_prefix = format!("proxy-cache/{}/simple/", repo_key);
+        let simple_prefix = format!("{PROXY_CACHE_KEY_PREFIX}{}/simple/", repo_key);
         let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for key in keys {
             let Some(rest) = key.strip_prefix(&simple_prefix) else {
@@ -5311,7 +5328,7 @@ impl ProxyService {
     /// Returns paths sorted + deduped (see [`Self::cached_artifact_paths`]),
     /// or an empty list when the storage backend cannot list the prefix.
     pub async fn list_cached_paths(&self, repo_key: &str) -> Vec<String> {
-        let prefix = format!("proxy-cache/{}/", repo_key);
+        let prefix = format!("{PROXY_CACHE_KEY_PREFIX}{}/", repo_key);
         let keys = match self.storage.list(Some(&prefix)).await {
             Ok(keys) => keys,
             Err(e) => {
@@ -5405,7 +5422,7 @@ impl ProxyService {
     where
         I: IntoIterator<Item = &'a str>,
     {
-        let prefix = format!("proxy-cache/{}/", repo_key);
+        let prefix = format!("{PROXY_CACHE_KEY_PREFIX}{}/", repo_key);
         let mut paths: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for key in keys {
             let Some(rest) = key.strip_prefix(&prefix) else {
@@ -5588,7 +5605,7 @@ impl ProxyService {
     /// distinction matters when presigning: cache keys must be signed through
     /// the no-prefix [`Self::cache_storage_backend`] handle (#1555).
     pub fn is_proxy_cache_key(storage_key: &str) -> bool {
-        storage_key.starts_with("proxy-cache/")
+        storage_key.starts_with(PROXY_CACHE_KEY_PREFIX)
     }
 
     /// Purge every proxy-cache object for a repository from the global default
@@ -5617,7 +5634,7 @@ impl ProxyService {
     /// prefix is repo-key scoped, so calling this for a hosted repository (which
     /// has no proxy cache) is a harmless empty list.
     pub async fn purge_repo_cache(&self, repo_key: &str) -> Result<usize> {
-        let prefix = format!("proxy-cache/{}/", repo_key);
+        let prefix = format!("{PROXY_CACHE_KEY_PREFIX}{}/", repo_key);
         let keys = self.storage.list(Some(&prefix)).await?;
         let mut deleted = 0usize;
         for key in keys {
@@ -5656,7 +5673,7 @@ impl ProxyService {
     /// instead of surfacing as an opaque 400/500 from the object-store SDK
     /// mid-fetch (#1044).
     fn check_cache_key_length(repo_key: &str, trimmed_path: &str) -> Result<()> {
-        const PREFIX: &str = "proxy-cache/";
+        const PREFIX: &str = PROXY_CACHE_KEY_PREFIX;
         const WORST_SUFFIX: &str = "__cache_meta__.json";
         // Two interior '/' separators are added by the format!() calls.
         let worst_len =
@@ -6858,6 +6875,61 @@ mod tests {
         assert!(!ProxyService::is_proxy_cache_key(&format!(
             "{TEE_STAGING_KEY_PREFIX}0f8fad5b-d9cb-469f-a165-70867728950e"
         )));
+    }
+
+    /// #3368 drift guard: BOTH key spaces the proxy cache writes must be
+    /// declared bucket-root-anchored in the storage layer.
+    ///
+    /// The prefix policy now follows the key, not the handle. If a new cache
+    /// namespace is introduced here (or one of these constants is renamed)
+    /// without updating `BUCKET_ROOT_KEY_NAMESPACES`, S3 would compose
+    /// `<S3_PREFIX>/<key>` for objects the prefix-less proxy handle writes at
+    /// the root — reopening exactly the split this closed. There is no
+    /// compiler link between the two lists, so it is asserted.
+    #[test]
+    fn test_proxy_cache_namespaces_are_declared_bucket_root_anchored_3368() {
+        for prefix in [PROXY_CACHE_KEY_PREFIX, TEE_STAGING_KEY_PREFIX] {
+            assert!(
+                crate::storage::BUCKET_ROOT_KEY_NAMESPACES.contains(&prefix),
+                "{prefix} is written by the prefix-less proxy-cache handle but is not \
+                 declared in BUCKET_ROOT_KEY_NAMESPACES (#3368)"
+            );
+        }
+
+        // Not just the constants: the keys actually derived from them.
+        let keys = CacheKeys::derive("pypi-remote", "simple/six/six-1.17.0.whl")
+            .expect("derive cache keys");
+        for key in [keys.content.as_str(), keys.metadata.as_str()] {
+            assert!(
+                crate::storage::key_is_bucket_root_anchored(key),
+                "derived cache key {key} must resolve at the bucket root"
+            );
+        }
+        assert!(crate::storage::key_is_bucket_root_anchored(&format!(
+            "{TEE_STAGING_KEY_PREFIX}0f8fad5b-d9cb-469f-a165-70867728950e"
+        )));
+
+        // Not only the content/sidecar pair: every key space the proxy cache
+        // addresses through its own prefix-less handle must be anchored, or a
+        // prefixed S3 deployment would resolve it to two different objects.
+        // These used to be hand-written `"proxy-cache/"` literals; they are
+        // built from the constant now, and this pins the results.
+        let epoch = ProxyService::release_epoch_key("debian-remote", "bookworm")
+            .expect("derive release epoch key");
+        assert!(
+            crate::storage::key_is_bucket_root_anchored(&epoch),
+            "release-epoch sidecar {epoch} must resolve at the bucket root"
+        );
+        for listing_prefix in [
+            format!("{PROXY_CACHE_KEY_PREFIX}pypi-remote/simple/"),
+            format!("{PROXY_CACHE_KEY_PREFIX}pypi-remote/"),
+        ] {
+            assert!(
+                crate::storage::key_is_bucket_root_anchored(&listing_prefix),
+                "listing prefix {listing_prefix} must resolve at the bucket root, or a purge \
+                 sweep would enumerate a different key space than the writes it reclaims"
+            );
+        }
     }
 
     #[test]
