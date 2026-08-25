@@ -3,8 +3,8 @@
 # Pre-tag release readiness check (issue #3042).
 #
 # Run this BEFORE cutting a release/RC tag (see RELEASING.md). It asserts that
-# `main` is actually releasable, so a stale main does not cost a full re-cut
-# cycle. The motivating incident (#3039): v1.7.0-rc.1 stalled ~90 minutes at
+# THE REF BEING CUT is actually releasable, so a stale tree does not cost a
+# full re-cut cycle. The motivating incident (#3039): v1.7.0-rc.1 stalled ~90 minutes at
 # docker-publish's Security Scan because `main` was missing two trivy-CLI CVE
 # suppressions that lived only on `release/1.6.x` (#2997/#3040). Security Scan
 # HARD-gates the multi-arch manifest, which gates resolve-candidate-digest,
@@ -21,6 +21,14 @@
 #      main means main's images fail Security Scan -> no release can be cut
 #      from main. This is the exact #3039 gap. Enumeration mirrors
 #      check-migration-ledger.sh.
+#
+#      This one check is MAIN-CENTRIC and is skipped (loudly) when the audited
+#      ref is a `release/*` branch. Its subject is "can a cut from main clear
+#      Security Scan given what the maintenance branches suppress"; a
+#      maintenance branch's own images are scanned against its OWN
+#      .trivyignore, so another branch's suppressions say nothing about it and
+#      the branch comparing against itself is vacuous. Running it anyway would
+#      manufacture drift findings that no cut from that branch can act on.
 #
 #      The tombstone form exists because a plain superset rule makes the set
 #      monotonic (#3309): a suppression provably dead for main's images could
@@ -130,12 +138,26 @@
 # Exit-code contract (mirrors scripts/ci/check-migration-ledger.sh):
 #   0  ready       -- no blocking problem found.
 #   1  NOT READY   -- a real, blocking problem (drift, version mismatch, or a
-#                     measured-red Docker Publish on main).
-#                     Fix it on main before tagging; NEVER retry it away.
+#                     measured-red Docker Publish for the audited commit).
+#                     Fix it on the ref being cut before tagging; NEVER retry
+#                     it away.
 #   2  INFRA       -- tooling/network failure (git ls-remote / gh / file reads
 #                     failed); retryable, NOT a readiness verdict.
 #
+# Exit 1 OUTRANKS exit 2 (#3538). If a check has already counted a blocking
+# problem and a LATER check cannot be measured, the run exits 1, not 2: the
+# blocking problem is definite, retrying will not remove it, and "retryable"
+# is the wrong instruction to hand an operator who is already not ready. This
+# does not weaken exit 2 in the direction that matters -- an indeterminate
+# result still never reads as a pass, and nothing that used to block stops
+# blocking. It only converts some exit-2s into exit-1s.
+#
 # Env overrides:
+#   PREFLIGHT_REF    the ref this run is a statement about. Names the verdict
+#                    line and decides whether check 1 applies. Defaults to the
+#                    checked-out branch name; a detached HEAD reports as
+#                    `HEAD`, which is not a `release/*` ref, so check 1 keeps
+#                    its historical behaviour when nothing says otherwise.
 #   PREFLIGHT_REPO   owner/name for the `gh api` calls (default: derived from
 #                    the origin remote, else artifact-keeper/artifact-keeper).
 #   PREFLIGHT_SKIP_DOCKER_HEALTH=1  do not run check 3 at all.
@@ -176,6 +198,35 @@ ok()   { printf '%s[ok]%s   %s\n' "$GRN" "$RST" "$*"; }
 bad()  { printf '%s[FAIL]%s %s\n' "$RED" "$RST" "$*"; problems=$((problems + 1)); }
 warn() { printf '%s[warn]%s %s\n' "$YEL" "$RST" "$*"; }
 
+# The single exit point for "this check could not be measured" (#3538).
+#
+# An indeterminate result must never read as a pass -- that part is #3308's
+# lesson and it is unchanged. It must not mask a verdict that is ALREADY
+# definite either, and that part was reachable: every INFRA site below exits
+# immediately, discarding whatever `problems` the earlier checks had already
+# counted. A run where check 1 found real forward-port drift AND ghcr was
+# briefly unreadable reported exit 2 -- "retryable" -- when the true answer
+# was "you are not ready, and retrying will not help". Telling an operator to
+# retry a definite red is how a red gets laundered into a rerun.
+#
+# So the exit code is the STRONGEST claim the run has actually earned:
+#   * nothing blocking counted yet -> exit 2, INFRA, exactly as before.
+#   * something blocking counted   -> exit 1, NOT READY.
+# Checks only ever ADD problems (`bad` increments, nothing decrements), so a
+# NOT READY reached here cannot be withdrawn by a check that did not run. The
+# audit IS incomplete, though, so the verdict line says so instead of implying
+# a clean sweep.
+infra_exit() {
+  if [[ "$problems" -gt 0 ]]; then
+    echo "${RED}NOT READY${RST} to cut from ${AUDIT_REF:-?}@${AUDIT_SHA:-?}: $problems blocking problem(s) found before a later check could not be measured (see the INFRA line above)."
+    echo "  The blocking problems are real and are not retryable. The remaining"
+    echo "  checks did not run, so this audit is incomplete -- fix these, then"
+    echo "  re-run the preflight for a full verdict."
+    exit 1
+  fi
+  exit 2
+}
+
 # repo slug for gh
 REPO="${PREFLIGHT_REPO:-}"
 if [[ -z "$REPO" ]]; then
@@ -198,13 +249,39 @@ retired_tokens() {
     | sed 's/^# RETIRED: //' | sort -u
 }
 
+# --- which ref is this run a statement about? -------------------------------
+#
+# The workflow used to hardcode `ref: main` in its checkout, so a preflight
+# dispatched from release/1.7.x audited main and said READY about it. Naming
+# the ref in the verdict is what makes that mistake unrepeatable: a transcript
+# that says which ref it evaluated cannot be read as one about another.
+#
+# refs/heads/ is stripped so `refs/heads/release/1.7.x` and `release/1.7.x`
+# print (and match) identically no matter which of the two the caller passes.
+AUDIT_REF="${PREFLIGHT_REF:-}"
+if [[ -z "$AUDIT_REF" ]]; then
+  AUDIT_REF="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
+fi
+AUDIT_REF="${AUDIT_REF#refs/heads/}"
+AUDIT_SHA="$(git rev-parse --short HEAD 2>/dev/null || echo '?')"
+
+# True for a maintenance branch, false for main / a tag / a detached HEAD.
+is_release_branch_ref() { [[ "$AUDIT_REF" == release/* ]]; }
+
 echo "== release preflight =="
-echo "repo: $REPO   ref: $(git rev-parse --short HEAD 2>/dev/null || echo '?')"
+echo "repo: $REPO   ref: ${AUDIT_REF}@${AUDIT_SHA}"
 echo
 
 # --- check 1: .trivyignore forward-port drift -------------------------------
 echo "1) .trivyignore forward-port drift (main must account for release/* suppressions)"
-if [[ ! -f .trivyignore ]]; then
+if is_release_branch_ref; then
+  note "NOT APPLICABLE: this check asks whether MAIN accounts for the"
+  note "suppressions on every release/* branch, and the audited ref is"
+  note "${AUDIT_REF}. A maintenance branch's images are scanned against its own"
+  note ".trivyignore, so another branch's suppressions are not a claim about"
+  note "this cut -- and comparing the branch against itself is vacuous."
+  note "Run this check against main (its forward-port drift is main's problem)."
+elif [[ ! -f .trivyignore ]]; then
   warn "no .trivyignore at repo root -- skipping drift check"
 else
   main_tokens="$(suppression_tokens < .trivyignore)"
@@ -223,7 +300,7 @@ else
   # enumerate active release branches (works on a shallow checkout)
   if ! remote_refs="$(git ls-remote --heads origin 'release/*' 2>/dev/null)"; then
     echo "INFRA: git ls-remote for release/* failed" >&2
-    exit 2
+    infra_exit
   fi
   rel_branches="$(printf '%s\n' "$remote_refs" | sed -E 's#^[0-9a-f]+\trefs/heads/##' | sort -u)"
   if [[ -z "$rel_branches" ]]; then
@@ -293,7 +370,7 @@ else
   head_sha="$(git rev-parse HEAD 2>/dev/null || true)"
   if [[ -z "$head_sha" ]]; then
     echo "INFRA: could not resolve HEAD" >&2
-    exit 2
+    infra_exit
   fi
   # Select the run for THIS commit, never "the latest run" (#3338): recency
   # is a proxy that diverges when main has moved, a publish is in flight, or
@@ -305,7 +382,7 @@ else
     # gh is present but the query failed (auth, network, API). We could not
     # measure, so we must not render a readiness verdict either way.
     echo "INFRA: could not query Docker Publish runs for $head_sha" >&2
-    exit 2
+    infra_exit
   fi
   if [[ -z "$run_info" ]]; then
     # A fourth outcome, distinct from "ran and failed" (#3338): the query
@@ -319,7 +396,7 @@ else
     read -r run_id run_status <<< "$run_info"
     if [[ -z "$run_id" || -z "$run_status" ]]; then
       echo "INFRA: unparseable Docker Publish run answer for $head_sha ('$run_info')" >&2
-      exit 2
+      infra_exit
     fi
     if [[ "$run_status" != "completed" ]]; then
       # In flight is not absent and not green: block and say to wait rather
@@ -335,7 +412,7 @@ else
       note "run $run_id: Security Scan=$sec, Backend Multi-Arch Manifest=$man"
       if [[ "$sec" == "?" || "$man" == "?" ]]; then
         echo "INFRA: could not read job conclusions from run $run_id" >&2
-        exit 2
+        infra_exit
       elif [[ "$sec" == "success" && "$man" == "success" ]]; then
         ok "this commit's images published cleanly"
       elif [[ "${PREFLIGHT_ALLOW_RED_PUBLISH:-0}" == "1" ]]; then
@@ -382,7 +459,7 @@ if [[ "${PREFLIGHT_SKIP_VERSION_PIN:-0}" == "1" ]]; then
   note "which is not the same as it passing."
 elif [[ ! -x "$TAG_STATE_CMD" || ! -x "$TAG_REVISION_CMD" ]]; then
   echo "INFRA: registry probe scripts not found/executable ($TAG_STATE_CMD, $TAG_REVISION_CMD)" >&2
-  exit 2
+  infra_exit
 else
   for component in "${VERSION_PINNED_COMPONENTS[@]}"; do
     IFS='|' read -r vfile suffix srcpaths <<< "$component"
@@ -410,7 +487,7 @@ else
         # Includes `indeterminate` and an empty/absent probe answer. We could
         # not read the registry, so we must not render a verdict either way.
         echo "INFRA: could not determine whether $image:$pinned is published (got '${state:-<no answer>}')" >&2
-        exit 2
+        infra_exit
         ;;
     esac
 
@@ -425,7 +502,7 @@ else
     fi
     if [[ ! "$rev" =~ ^[0-9a-f]{40}$ ]]; then
       echo "INFRA: could not read the source revision of $image:$pinned (got '${rev:-<no answer>}')" >&2
-      exit 2
+      infra_exit
     fi
 
     # A shallow checkout will not have the published commit; fetch just it.
@@ -434,7 +511,7 @@ else
     fi
     if ! git cat-file -e "${rev}^{commit}" 2>/dev/null; then
       echo "INFRA: $image:$pinned names commit $rev, which could not be fetched" >&2
-      exit 2
+      infra_exit
     fi
 
     if git diff --quiet "$rev" HEAD -- "${srcarr[@]}"; then
@@ -525,14 +602,14 @@ if [[ "${PREFLIGHT_SKIP_CHANGELOG_RECON:-0}" == "1" ]]; then
   note "which is not the same as it passing."
 elif [[ ! -f CHANGELOG.md ]]; then
   echo "INFRA: no CHANGELOG.md at the repo root" >&2
-  exit 2
+  infra_exit
 elif ! command -v gh >/dev/null 2>&1; then
   # Deliberately INFRA rather than a note: unlike checks 3 and 4 there is no
   # partial answer to give. Without the issue<->PR map every entry looks
   # unreconciled, so a "soft" version of this check would either spray false
   # positives or quietly pass.
   echo "INFRA: gh is not on PATH; the issue<->PR map cannot be built" >&2
-  exit 2
+  infra_exit
 else
   prev_tag="${PREFLIGHT_PREV_TAG:-}"
   if [[ -z "$prev_tag" ]]; then
@@ -542,7 +619,7 @@ else
   if [[ -z "$prev_tag" ]]; then
     echo "INFRA: no previous stable tag is reachable from HEAD -- cannot bound the" >&2
     echo "       commit range. Run 'git fetch --tags' and retry." >&2
-    exit 2
+    infra_exit
   fi
   note "range: ${prev_tag}..HEAD"
 
@@ -645,7 +722,7 @@ else
             --jq '.data.repository | to_entries[] | "\(.value.number):\([.value.closingIssuesReferences.nodes[].number] | join(","))"' \
             2>/dev/null)"; then
         echo "INFRA: could not resolve the PR->closing-issue map for ${prev_tag}..HEAD" >&2
-        exit 2
+        infra_exit
       fi
     fi
     closing_issues="$(printf '%s\n' "$closes_map" | cut -d: -f2 | tr ',' '\n' \
@@ -710,9 +787,14 @@ else
 fi
 echo
 # --- verdict ----------------------------------------------------------------
+#
+# The ref and sha are part of the verdict, not decoration. A bare "READY" is
+# ambiguous about WHAT is ready, and that ambiguity is exactly how v1.7.5,
+# v1.7.6 and v1.7.7 were each cut from release/1.7.x on the strength of a
+# preflight transcript that had, in fact, audited main.
 if [[ "$problems" -gt 0 ]]; then
-  echo "${RED}NOT READY${RST}: $problems blocking problem(s). Fix on main before tagging."
+  echo "${RED}NOT READY${RST} to cut from ${AUDIT_REF}@${AUDIT_SHA}: $problems blocking problem(s). Fix them on ${AUDIT_REF} before tagging."
   exit 1
 fi
-echo "${GRN}READY${RST}: no blocking problems. Safe to cut the tag."
+echo "${GRN}READY${RST} to cut from ${AUDIT_REF}@${AUDIT_SHA}: no blocking problems."
 exit 0
