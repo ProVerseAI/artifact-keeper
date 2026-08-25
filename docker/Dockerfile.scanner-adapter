@@ -41,14 +41,15 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
 # ---------- Stage 2: pull the matching trivy binary ----------
 # buildx selects this image's TARGETPLATFORM variant automatically, so the
 # arm64 build gets the arm64 trivy and the amd64 build gets amd64. Pinned to
-# 0.72.0, the latest release, which is rebuilt against a patched Go toolchain
-# and clears most of the bundled binary's Go-dependency CVEs (#2391; residuals
-# with no fixed trivy release yet are justified per-CVE in /.trivyignore).
+# 0.74.0, the latest release, which is rebuilt against a patched Go toolchain
+# and clears most of the bundled binary's Go-dependency CVEs (bumped from 0.72.0
+# to pick up oras-go 2.6.2, clearing the ORAS CVE set; residuals with no fixed
+# trivy release yet are justified per-CVE in /.trivyignore).
 # Nothing couples the backend to a specific trivy version: the 0.71.2 strings
 # in backend/scanner-adapter tests are mock/stub fixtures, and the adapter
 # probes the real version at startup (ProbeVersion). Aqua publishes both
 # linux/amd64 and linux/arm64 for this tag.
-FROM ghcr.io/aquasecurity/trivy:0.72.0 AS trivy
+FROM ghcr.io/aquasecurity/trivy:0.74.0 AS trivy
 
 # ---------- Stage 3: minimal runtime ----------
 # alpine 3.20 reached EOL; 3.24 is the current stable with active security

@@ -5,7 +5,7 @@
 # * Every entry below is a Go-dependency CVE compiled INTO one of the vendored
 #   scanner CLIs that AK images ship and invoke:
 #     - /usr/local/bin/grype  (ghcr.io/anchore/grype:v0.116.0, backend images)
-#     - /usr/local/bin/trivy  (ghcr.io/aquasecurity/trivy:0.72.0,
+#     - /usr/local/bin/trivy  (ghcr.io/aquasecurity/trivy:0.74.0,
 #       scanner-adapter image only — the backend images do NOT bundle trivy)
 #   Both are short-lived CLI subprocesses the services shell out to. They are
 #   NOT part of the network-reachable service surface (axum HTTP :8080 / gRPC
@@ -24,7 +24,7 @@
 #   vendored-scanner-binary CVEs that have no fixed *tool release* are listed.
 #
 # * Both tools are pinned to the latest upstream release (grype v0.116.0,
-#   trivy 0.72.0, bumped for #2391). For the CVEs below the dependency fix
+#   trivy 0.74.0). For the CVEs below the dependency fix
 #   exists upstream but no tagged tool release has been rebuilt against it
 #   yet (or, where noted, no upstream fix exists at all). They drop off
 #   automatically when the tools ship a release rebuilt against the fixed
@@ -42,8 +42,8 @@
 # grype v0.116.0 binary — Go stdlib @ go1.26.3
 # Fixed in Go 1.26.4/1.26.5 (1.25.11/1.25.12). grype v0.116.0 (latest) is
 # still built with go1.26.3. Drops off when grype ships a release built on
-# Go >= 1.26.5. (CVE-2026-39822 / CVE-2026-42505 also cover the trivy 0.72.0
-# binary, which is built with go1.26.4.)
+# Go >= 1.26.5. (CVE-2026-39822 / CVE-2026-42505 also cover the trivy 0.74.0
+# binary; re-verify its Go build toolchain with `go version -m` at each bump.)
 CVE-2026-27145
 CVE-2026-39822
 CVE-2026-42504
@@ -64,21 +64,13 @@ CVE-2026-41568
 CVE-2026-42306
 
 # ---------------------------------------------------------------------------
-# trivy 0.72.0 binary (scanner-adapter image) — oras.land/oras-go/v2 @ v2.6.0
-# Fixed in oras-go 2.6.1; trivy 0.72.0 (latest) has not rebuilt against it.
-# Code path: ORAS OCI-artifact client used for trivy's own DB/plugin
-# distribution; the adapter only points trivy at AK's registry for scans.
-CVE-2026-48978
-CVE-2026-50151
-CVE-2026-50162
-GHSA-vh4v-2xq2-g5cg
-
-# ---------------------------------------------------------------------------
-# trivy 0.72.0 binary (scanner-adapter image) — sigstore verification stack
+# trivy 0.74.0 binary (scanner-adapter image) — sigstore verification stack
 # github.com/sigstore/sigstore-go @ v1.1.4 (fixed 1.2.0) and
-# github.com/sigstore/timestamp-authority/v2 @ v2.0.6 (fixed 2.1.0); trivy
-# 0.72.0 (latest) has not rebuilt against them. MEDIUM severity — listed for
-# completeness (CI alerts on CRITICAL/HIGH only). Code path: cosign/rekor
-# attestation verification, not exercised by AK's adapter scan flow.
+# github.com/sigstore/timestamp-authority/v2 @ v2.0.6 (fixed 2.1.0). trivy
+# 0.74.0's go.mod no longer requires either module, so this bump is EXPECTED to
+# clear them — RETAINED here only until the post-0.74.0 CI re-scan confirms they
+# no longer flag, then remove (MEDIUM severity; CI alerts CRITICAL/HIGH only).
+# Code path: cosign/rekor attestation verification, not exercised by AK's
+# adapter scan flow.
 CVE-2026-49834
 CVE-2026-49835
