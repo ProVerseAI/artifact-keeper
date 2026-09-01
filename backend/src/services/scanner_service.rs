@@ -110,6 +110,53 @@ pub const PROXY_SCAN_INLINE_BUDGET: Duration = Duration::from_secs(30);
 /// pending, fail-closed 423) — never an unscanned serve.
 pub const OCI_PROXY_SCAN_INLINE_BUDGET: Duration = Duration::from_secs(120);
 
+/// Ceiling for the on-demand proxy-cache rescan budget (#3455). The actual
+/// per-request budget is [`proxy_rescan_budget`]; this constant only caps it.
+///
+/// [`PROXY_SCAN_INLINE_BUDGET`] exists to bound the latency a scan adds to a
+/// client's `pip install` (#2954) -- a request with a real client waiting on
+/// the other end. A rescan has no such client: it is an explicit,
+/// authenticated, write-gated, per-repository-throttled operator action
+/// (`POST .../security/proxy-scans/rescan`) whose only waiting party is the
+/// operator who asked for it. Reusing the 30s file budget there means an
+/// instance whose grype cold-start alone costs ~30s can NEVER complete a
+/// rescan. 120s matches [`OCI_PROXY_SCAN_INLINE_BUDGET`], the in-tree
+/// precedent for a context that can legitimately take longer than the file
+/// gate's 30s.
+pub const PROXY_RESCAN_BUDGET_CEILING: Duration = Duration::from_secs(120);
+
+/// The scan budget an individual rescan request actually runs under (#3455
+/// review, F2).
+///
+/// The rescan route is NOT exempt from the router-wide request timeout
+/// ([`Config::global_request_timeout_secs`](crate::config::Config::global_request_timeout_secs),
+/// default 120s -- `is_byte_transfer_path` exempts only artifact byte
+/// transfers), and that outer clock starts at request arrival, while this
+/// budget's clock starts only after auth, the repository and catalog lookups,
+/// the full cached-object read, and the SHA-256 -- with the verdict/SBOM/CVE
+/// writes still to come after the scan. A budget equal to the outer timeout
+/// therefore always loses the race: the backstop kills the request first,
+/// the operator gets the undifferentiated `SERVICE_UNAVAILABLE` 503 this
+/// endpoint exists to replace, no verdict is recorded, and
+/// `RESCAN_BUDGET_EXCEEDED` becomes dead code.
+///
+/// So the budget is derived from the configured outer timeout with real
+/// headroom -- a quarter of the outer window (at least one second) is
+/// reserved for the pre- and post-scan work above -- and capped at
+/// [`PROXY_RESCAN_BUDGET_CEILING`]. A `0` outer timeout is the config
+/// sentinel for "timeout layer disabled", in which case nothing races the
+/// budget and the ceiling is used directly.
+pub fn proxy_rescan_budget(global_request_timeout_secs: u64) -> Duration {
+    if global_request_timeout_secs == 0 {
+        return PROXY_RESCAN_BUDGET_CEILING;
+    }
+    let outer = Duration::from_secs(global_request_timeout_secs);
+    let headroom = (outer / 4).max(Duration::from_secs(1));
+    outer
+        .saturating_sub(headroom)
+        .min(PROXY_RESCAN_BUDGET_CEILING)
+}
+
 /// Below this size we keep the scan input in heap (`Bytes`) and skip the
 /// tempfile + mmap machinery entirely. The mmap path exists to keep
 /// multi-GiB artifacts off anon heap so the cgroup OOM killer leaves the
@@ -1244,11 +1291,13 @@ impl ScanWorkspace {
         // recursive delete actually succeeds; otherwise it fails with EACCES and
         // silently leaves the (often multi-GiB) tree on the PVC until it fills.
         let workspace_str = workspace.to_string_lossy().to_string();
-        if let Err(e) = tokio::process::Command::new("chmod")
-            .args(["-R", "u+rwX", &workspace_str])
-            .output()
-            .await
-        {
+        let mut chmod = tokio::process::Command::new("chmod");
+        // Cleanup itself remains inside the scanner future that an outer
+        // wall-clock timeout can drop. `Command` otherwise leaves chmod
+        // running against the workspace after that cancellation, so make this
+        // child cancellation-owned just like the scanner subprocesses (#3455).
+        chmod.kill_on_drop(true);
+        if let Err(e) = chmod.args(["-R", "u+rwX", &workspace_str]).output().await {
             warn!(
                 "Failed to pre-chmod scan workspace {} before cleanup: {}",
                 workspace.display(),
@@ -3426,7 +3475,14 @@ pub(crate) async fn capture_cli_output_with_timeout(
     // Spawn with stdout piped so we can bound the read. `Command::output`
     // would buffer the entire stdout into memory unconditionally; a
     // hostile binary printing 1 GiB to stdout would OOM the backend.
-    let mut child = match tokio::process::Command::new(binary)
+    let mut command = tokio::process::Command::new(binary);
+    // Callers can run scanner-version probes inside a wider scan timeout. If
+    // that outer timeout drops this future, Tokio otherwise leaves the probe
+    // child running. Version collection is best-effort and has no reason to
+    // outlive its caller, so cancellation must own the child just as it does
+    // for scanner and cleanup subprocesses (#3455).
+    command.kill_on_drop(true);
+    let mut child = match command
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -6662,12 +6718,19 @@ pub(crate) mod test_helpers {
     }
 
     /// Outcome of the mock CVE engine when a proxy serve path re-scans.
-    /// Shared by the #2976 verdict-freshness handler tests (PyPI, npm).
+    /// Shared by the #2976 verdict-freshness handler tests (PyPI, npm) and the
+    /// #3455 inline-gate / rescan-budget regression tests.
+    #[derive(Clone, Copy)]
     pub enum MockCveRescan {
         /// Re-scan against the bumped CVE-DB now flags the bytes.
         Vulnerable,
         /// Re-scan is inconclusive (scanner hard-error).
         Error,
+        /// Re-scan never finishes inside the caller's `tokio::time::timeout`
+        /// budget: sleeps for the given duration (longer than the budget
+        /// under test) before completing. Proves the BudgetExceeded arm
+        /// end-to-end (#3455) without a real grype subprocess.
+        Hang(std::time::Duration),
     }
 
     /// CVE-authoritative mock scanner reporting a fixed live version string.
@@ -6704,6 +6767,10 @@ pub(crate) mod test_helpers {
                 MockCveRescan::Error => Err(crate::error::AppError::Internal(
                     "simulated grype failure on re-scan".to_string(),
                 )),
+                MockCveRescan::Hang(d) => {
+                    tokio::time::sleep(d).await;
+                    Ok(crate::services::scanner_service::ScanOutput::default())
+                }
                 MockCveRescan::Vulnerable => {
                     Ok(crate::services::scanner_service::ScanOutput::findings_only(
                         vec![crate::models::security::RawFinding {
@@ -6773,6 +6840,126 @@ mod tests {
     use bytes::Bytes;
     use chrono::Utc;
     use uuid::Uuid;
+
+    /// Validates the budget/outer-timeout relation (#3455 review, F2): for
+    /// every enabled outer timeout the derived budget must be STRICTLY inside
+    /// it, or the router backstop fires first and `RESCAN_BUDGET_EXCEEDED`
+    /// is unreachable. This is the pure-function half; the router-level
+    /// regression lives with the rescan endpoint in `security.rs`.
+    #[test]
+    fn proxy_rescan_budget_always_fits_inside_the_global_request_timeout() {
+        for outer_secs in [1u64, 2, 3, 5, 8, 30, 60, 119, 120, 121, 300, 86_400] {
+            let budget = proxy_rescan_budget(outer_secs);
+            assert!(
+                budget < Duration::from_secs(outer_secs),
+                "budget {budget:?} must be strictly under the {outer_secs}s outer timeout, \
+                 or the generic timeout 503 always wins the race"
+            );
+            assert!(
+                budget <= PROXY_RESCAN_BUDGET_CEILING,
+                "budget {budget:?} must never exceed the ceiling"
+            );
+        }
+    }
+
+    /// The default deployment (`GLOBAL_REQUEST_TIMEOUT_SECS` unset = 120s)
+    /// must leave real headroom for the work outside the budget clock: auth,
+    /// two DB lookups, up to a 200 MiB object read + SHA-256 before the scan,
+    /// and the verdict/SBOM/CVE writes after it. A quarter of the window is
+    /// reserved, so the default budget is 90s.
+    #[test]
+    fn proxy_rescan_budget_reserves_headroom_at_the_default_timeout() {
+        assert_eq!(proxy_rescan_budget(120), Duration::from_secs(90));
+    }
+
+    /// `0` disables the router timeout layer entirely (see
+    /// `apply_global_backstop`), so nothing races the budget and the full
+    /// ceiling applies. And a very large outer timeout must not inflate the
+    /// budget past the ceiling.
+    #[test]
+    fn proxy_rescan_budget_uses_the_ceiling_when_nothing_races_it() {
+        assert_eq!(proxy_rescan_budget(0), PROXY_RESCAN_BUDGET_CEILING);
+        assert_eq!(proxy_rescan_budget(1_000_000), PROXY_RESCAN_BUDGET_CEILING);
+    }
+
+    /// Extract the cancellation-owned `chmod` invocation from
+    /// [`ScanWorkspace::cleanup_path`]. A source-shape pin is intentionally
+    /// cheap: exercising a dropped future while a recursive chmod races real
+    /// filesystem cleanup is not deterministic enough to be a useful runtime
+    /// regression.
+    fn cleanup_chmod_body() -> &'static str {
+        let src = include_str!("scanner_service.rs");
+        let marker = "pub async fn cleanup_path(workspace: &Path) {";
+        let start = src
+            .find(marker)
+            .expect("ScanWorkspace::cleanup_path must exist");
+        let rest = &src[start + marker.len()..];
+        &rest[..rest
+            .find("\n    }\n")
+            .expect("ScanWorkspace::cleanup_path must close")]
+    }
+
+    /// `chmod` runs inside the same timeout-owned scanner future as the
+    /// scanner processes. Pin its explicit command configuration so a future
+    /// cleanup refactor cannot reintroduce an orphaned child (#3455).
+    #[test]
+    fn cleanup_chmod_is_killed_when_the_scanner_future_is_dropped() {
+        let body = cleanup_chmod_body();
+        assert!(
+            body.contains("let mut chmod = tokio::process::Command::new(\"chmod\");"),
+            "cleanup must retain a distinct chmod Command so its cancellation ownership is explicit: {body}"
+        );
+        assert!(
+            body.contains("chmod.kill_on_drop(true);"),
+            "a timeout dropping cleanup must kill chmod rather than orphan it: {body}"
+        );
+        assert!(
+            body.contains(".args([\"-R\", \"u+rwX\", &workspace_str])"),
+            "the chmod pin must cover the recursive workspace cleanup command: {body}"
+        );
+    }
+
+    /// Source slice of the shared version-probe capture helper. This is a
+    /// deterministic cancellation-ownership regression: process-table timing
+    /// is host dependent, while the Tokio command configuration is the direct
+    /// behavior contract CI needs to preserve.
+    fn capture_cli_output_spawn_body() -> &'static str {
+        let src = include_str!("scanner_service.rs");
+        let marker = "pub(crate) async fn capture_cli_output_with_timeout(";
+        let start = src
+            .find(marker)
+            .expect("capture_cli_output_with_timeout must exist");
+        let rest = &src[start + marker.len()..];
+        &rest[..rest
+            .find("\n}\n\n/// TTL")
+            .expect("capture_cli_output_with_timeout must end before cache constants")]
+    }
+
+    /// A wider caller timeout can drop the shared version-probe future. Pin
+    /// the explicit command ownership that makes Tokio kill that child rather
+    /// than leaving a hung probe alive after its scan has timed out (#3455).
+    #[test]
+    fn capture_cli_output_spawn_is_cancellation_owned() {
+        let body = capture_cli_output_spawn_body();
+        let command = "let mut command = tokio::process::Command::new(binary);";
+        let ownership = "command.kill_on_drop(true);";
+        assert!(
+            body.contains(command),
+            "the shared CLI probe must construct one explicit Command: {body}"
+        );
+        assert!(
+            body.contains(ownership),
+            "a dropped outer timeout must kill the shared CLI probe child: {body}"
+        );
+        let ownership_at = body
+            .find(ownership)
+            .expect("the ownership assertion above found this text");
+        let spawn_at = body.find(".spawn()").expect("probe must spawn a child");
+        assert!(
+            ownership_at < spawn_at,
+            "kill_on_drop must be configured before spawning the probe: {body}"
+        );
+    }
 
     // -----------------------------------------------------------------------
     // post_scan_status_decision (pure post-scan quarantine decision)
