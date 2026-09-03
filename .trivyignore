@@ -144,6 +144,80 @@ CVE-2026-41568
 CVE-2026-42306
 
 # ---------------------------------------------------------------------------
+# scanner-adapter image only — usr/local/bin/trivy @ google.golang.org/grpc
+# CVE-2026-84304 (HIGH, grpc-go v1.82.1, fixed in 1.83.1).
+#
+# WHY THIS IS HERE AND THE IDENTICAL FINDING IN grype IS NOT.
+# The same advisory hit both bundled scanner CLIs on this fork's first Docker
+# Publish run that ever reached the Security Scan at all (every earlier run
+# died in the build jobs on a Docker Hub login, so the gate had never
+# executed). Two binaries, one CVE, two different answers — because the
+# provenance differs and this file's bar is about buildability, not severity:
+#
+#   * /usr/local/bin/grype — we COMPILE it from anchore/grype source in
+#     docker/Dockerfile.backend, so grpc v1.83.1 is a version we can build
+#     against. FIXED THERE, with a dependency override in the grype-bin stage
+#     modelled on the #3465 x/mod block. It is deliberately NOT suppressed;
+#     that would be the treadmill #3352 removed.
+#   * /usr/local/bin/trivy — COPYed out of
+#     ghcr.io/artifact-keeper/trivy@sha256:37317c08..., a digest-pinned image
+#     this fork does not build. There is no lever: `crane ls
+#     ghcr.io/artifact-keeper/trivy` returns 0.73.0-r1, 0.73.0-r2 and
+#     0.74.0-r1, and 0.74.0-r1 IS the pinned digest — upstream has published
+#     no rebuilt image carrying grpc >= 1.83.1. Overriding a dependency in a
+#     binary we do not compile is not available. That is exactly "a dependency
+#     CVE where no consumable fixed version exists to build against".
+#
+# SCOPE. grpc reaches the trivy binary through its OCI/registry and remote-
+# scan client paths. The adapter drives trivy as a short-lived CLI subprocess
+# against local filesystem targets; it is not part of the network-reachable
+# service surface (adapter HTTP :8080).
+#
+# THE COST, STATED PLAINLY. The plain .trivyignore format matches on CVE id
+# with no path scoping, so this token also silences the finding for the grype
+# binary in the backend image — the one we just fixed. That is a real
+# weakening and it is why the fix does not rely on this file to stay honest:
+# the grype-bin stage asserts, against the compiled binary's Go build info,
+# that it records google.golang.org/grpc v1.83.1, and FAILS THE BUILD if it
+# does not. A regression in the override is caught by a check this token
+# cannot reach, and caught earlier than a scan would catch it.
+#
+# PATH SCOPING WAS EVALUATED AND REJECTED, so nobody has to re-derive it.
+# Trivy's structured ignore file does support it, and it works: measured with
+# trivy 0.74.0, a `vulnerabilities: [{id: CVE-2026-84304, paths:
+# [usr/local/bin/trivy]}]` entry silences the adapter's finding while the same
+# CVE at usr/local/bin/grype is still reported (exit 1). Two things stop it
+# being worth taking:
+#   * aquasecurity/trivy-action refuses to mix formats — "Cannot mix YAML and
+#     plain trivy ignore files", and at most ONE yaml file — so scoping this
+#     one token means converting this entire file, its tombstone block and all
+#     of its prose, plus the four workflows and scripts that name it.
+#   * More decisively, and independently of the mechanism: every token here is
+#     read by scripts/ci/release-preflight.sh check 1 with
+#     `grep -oE '^(CVE-....|GHSA-....)'`, anchored at the start of a line. A
+#     YAML file indents the id under `- id:`, so the token becomes invisible
+#     to that gate and the suppression reads as a DELETED one — the exact
+#     forward-port drift check 1 exists to catch (#3039). A Rego
+#     --ignore-policy would hide it from that gate just as thoroughly.
+# Trading a scan-level over-suppression, which the build-info assertion above
+# already covers, for a hole in the gate that tracks suppressions across
+# branches is a bad trade. Revisit if release-preflight ever learns the
+# structured format.
+#
+# HISTORY WORTH READING: the tombstone block at the bottom of this file
+# retired GHSA-hrxh-6v49-42gf on the grounds that "grype v0.117.0 ships
+# grpc-go v1.82.1 (the fixed version)". v1.82.1 is the vulnerable version
+# here. Same dependency, one advisory later. Do not read a retirement as a
+# permanent clearance for a module.
+#
+# REMOVAL CONDITION: delete this token when the scanner-adapter's trivy pin
+# moves to a build carrying grpc >= 1.83.1 — either a newer
+# artifact-keeper/trivy image, or a ghcr.io/proverseai/trivy we build
+# ourselves. Re-measure on every scanner bump; the header's rule applies —
+# suppress when there is no fix to build against, rebuild when there is.
+CVE-2026-84304
+
+# ---------------------------------------------------------------------------
 # DELIBERATELY NOT SUPPRESSED (#3262) — go-git in the PUBLISHED images only.
 #
 # The 2026-08-10 weekly scan reported two findings against

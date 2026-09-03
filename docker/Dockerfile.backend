@@ -258,10 +258,12 @@ ARG TARGETARCH
 ARG GRYPE_VERSION=0.117.0
 ARG GRYPE_COMMIT=b5fa92bbcbef655497e3be840a2f718380e2cdd3
 ARG GO_MIN_PATCH=1.26.6
-# The single declared divergence from upstream grype at this tag. See the
-# override block below the clone for the justification and removal condition.
+# The declared divergences from upstream grype at this tag. See the override
+# blocks below the clone for the justification and removal condition of each.
 ARG XMOD_FROM=v0.38.0
 ARG XMOD_TO=v0.40.0
+ARG GRPC_FROM=v1.82.1
+ARG GRPC_TO=v1.83.1
 
 RUN apk add --no-cache git ca-certificates
 
@@ -395,6 +397,87 @@ RUN set -eu; \
     go mod verify; \
     echo "grype build: override applied — golang.org/x/mod ${XMOD_FROM} -> ${XMOD_TO}"
 
+# ---- Dependency override: google.golang.org/grpc ${GRPC_FROM} -> ${GRPC_TO}
+#
+# CVE-2026-84304 (HIGH, fixed in grpc-go 1.83.1) is reported against
+# `usr/local/bin/grype` and failed the Docker Publish Security Scan on this
+# fork's first run that ever reached the scan at all — every earlier run died
+# in the build jobs, so the gate had never actually executed here.
+#
+# Same three levers as the x/mod block above, same order of preference:
+#   1. bump GRYPE_VERSION to a release that carries the fix
+#   2. rebuild on a newer Go toolchain, for a stdlib CVE
+#   3. override a module version ourselves                   (here)
+# Lever 1 does not apply: v0.117.0 is still the latest anchore/grype release
+# and it pins grpc ${GRPC_FROM} transitively. Lever 2 does not apply: grpc is a
+# module in the dependency graph, not the standard library, so GO_MIN_PATCH
+# cannot reach it. Only lever 3 is left.
+#
+# URGENCY, honestly stated — AND IT IS NOT THE X/MOD STORY. That block could
+# say the vulnerable code was not linked in at all. This one cannot: grpc IS in
+# grype's build graph (`go list -deps ./cmd/grype` links grpc itself plus
+# grpclog, credentials, metadata, resolver, balancer, status, channelz and
+# more), reached through the OTEL/GCP exporter chain. So this is a fixable HIGH
+# in code the shipped binary actually contains, which is the strongest case for
+# lever 3 rather than a /.trivyignore entry — that file is for findings with no
+# fix available in a tool we can build, and we build this one.
+#
+# Note the contrast with the sibling scanner-adapter image, which hits the
+# IDENTICAL CVE in `usr/local/bin/trivy`. That binary is COPYed out of a
+# digest-pinned upstream image this fork does not build and cannot rebuild, and
+# no newer artifact-keeper/trivy build exists to re-pin to, so there is no
+# lever 3 available there. Same advisory, different provenance, different
+# remedy — the asymmetry is the point, not an inconsistency.
+#
+# MVS consequences are part of the override, not a surprise, and this one moves
+# more than x/mod did — twelve modules rather than five, because grpc carries
+# the OTEL and genproto chains with it. The set is deterministic given the
+# pinned grype commit AND the x/mod override above (it runs first, so this
+# resolution starts from that state). It is asserted below: if `go get` ever
+# moves a module outside the declared set, the build fails rather than shipping
+# an undeclared divergence.
+#
+# The moved-set is measured against a COPY of go.mod rather than `git diff`,
+# unlike the x/mod block. By this point the working tree already carries that
+# block's edits, so a git diff would fold its five modules into this block's
+# twelve and neither guard would mean what it says.
+#
+# REMOVAL CONDITION: delete this block, and the GRPC_FROM/GRPC_TO ARGs, when
+# GRYPE_VERSION is moved to a grype release whose resolved graph pins
+# grpc >= ${GRPC_TO}. The guard below asserts the pinned source still requires
+# ${GRPC_FROM} and FAILS THE BUILD when it does not, so the tag bump that makes
+# this block redundant is also what stops the build until it is deleted.
+RUN set -eu; \
+    grpc_pin() { sed -n 's|^[[:space:]]*google\.golang\.org/grpc \(v[^ ]*\).*|\1|p' go.mod | head -n1; }; \
+    have="$(grpc_pin)"; \
+    if [ "${have}" != "${GRPC_FROM}" ]; then \
+      echo "ERROR: grype v${GRYPE_VERSION} resolves google.golang.org/grpc ${have}, not ${GRPC_FROM}." >&2; \
+      echo "       This override was written against ${GRPC_FROM}. If upstream now" >&2; \
+      echo "       ships >= ${GRPC_TO}, DELETE the override block in this stage." >&2; \
+      echo "       If it moved to some other version, re-review it." >&2; \
+      exit 1; \
+    fi; \
+    cp go.mod /tmp/go.mod.pre-grpc; \
+    go get "google.golang.org/grpc@${GRPC_TO}"; \
+    got="$(grpc_pin)"; \
+    if [ "${got}" != "${GRPC_TO}" ]; then \
+      echo "ERROR: override did not take: go.mod pins google.golang.org/grpc ${got}." >&2; \
+      exit 1; \
+    fi; \
+    moved="$(diff -u /tmp/go.mod.pre-grpc go.mod \
+             | sed -n 's|^+[[:space:]]*\([^ ]*\) v.*|\1|p' | sort -u | tr '\n' ' ')"; \
+    expected="cel.dev/expr github.com/GoogleCloudPlatform/opentelemetry-operations-go/detectors/gcp github.com/spiffe/go-spiffe/v2 go.opentelemetry.io/contrib/detectors/gcp go.opentelemetry.io/otel go.opentelemetry.io/otel/metric go.opentelemetry.io/otel/sdk go.opentelemetry.io/otel/sdk/metric go.opentelemetry.io/otel/trace google.golang.org/genproto/googleapis/api google.golang.org/genproto/googleapis/rpc google.golang.org/grpc "; \
+    if [ "${moved}" != "${expected}" ]; then \
+      echo "ERROR: go get moved an undeclared set of modules." >&2; \
+      echo "       expected: ${expected}" >&2; \
+      echo "       actual:   ${moved}" >&2; \
+      echo "       Re-review the override and update the declared set." >&2; \
+      exit 1; \
+    fi; \
+    rm -f /tmp/go.mod.pre-grpc; \
+    go mod verify; \
+    echo "grype build: override applied — google.golang.org/grpc ${GRPC_FROM} -> ${GRPC_TO}"
+
 # ldflags mirror .goreleaser.yaml at this tag so the built binary reports the
 # same identity upstream's release does. buildDate is the commit timestamp
 # rather than "now": a wall-clock date would make every rebuild produce a
@@ -435,7 +518,15 @@ RUN set -eu; \
       echo "       The Trivy gate reads this build info; the override did not ship (#3465)." >&2; \
       exit 1; \
     fi; \
-    echo "grype build: build info verified — golang.org/x/mod ${recorded} across ${deps} deps"
+    recorded_grpc="$(printf '%s\n' "${info}" \
+                | sed -n 's|^[[:space:]]*dep[[:space:]]*google\.golang\.org/grpc[[:space:]]*\(v[^[:space:]]*\).*|\1|p' \
+                | head -n1)"; \
+    if [ "${recorded_grpc}" != "${GRPC_TO}" ]; then \
+      echo "ERROR: compiled grype records google.golang.org/grpc '${recorded_grpc}', want ${GRPC_TO}." >&2; \
+      echo "       The Trivy gate reads this build info; the override did not ship." >&2; \
+      exit 1; \
+    fi; \
+    echo "grype build: build info verified — golang.org/x/mod ${recorded}, google.golang.org/grpc ${recorded_grpc}, across ${deps} deps"
 
 # ---------- Stage 5b: Pre-seed the Grype vulnerability DB ----------
 # Populates the Grype DB at build time so the image works on egress-restricted

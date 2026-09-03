@@ -99,6 +99,8 @@ ARG GRYPE_COMMIT=b5fa92bbcbef655497e3be840a2f718380e2cdd3
 ARG GO_MIN_PATCH=1.26.6
 ARG XMOD_FROM=v0.38.0
 ARG XMOD_TO=v0.40.0
+ARG GRPC_FROM=v1.82.1
+ARG GRPC_TO=v1.83.1
 
 RUN apk add --no-cache git ca-certificates
 
@@ -152,6 +154,46 @@ RUN set -eu; \
     go mod verify; \
     echo "grype build: override applied — golang.org/x/mod ${XMOD_FROM} -> ${XMOD_TO}"
 
+# ---- Dependency override: google.golang.org/grpc ${GRPC_FROM} -> ${GRPC_TO}
+# CVE-2026-84304 (HIGH, fixed in grpc-go 1.83.1) against the compiled grype
+# binary. Kept byte-for-byte in step with docker/Dockerfile.backend, which
+# carries the full rationale — an errata mechanism that only one of the two
+# backend runtimes has is a gap waiting for the next advisory, which is
+# exactly the asymmetry #3612 was.
+#
+# The moved-set is measured against a COPY of go.mod rather than `git diff`,
+# because the x/mod block above has already edited the working tree and a git
+# diff would fold its five modules into this block's twelve.
+RUN set -eu; \
+    grpc_pin() { sed -n 's|^[[:space:]]*google\.golang\.org/grpc \(v[^ ]*\).*|\1|p' go.mod | head -n1; }; \
+    have="$(grpc_pin)"; \
+    if [ "${have}" != "${GRPC_FROM}" ]; then \
+      echo "ERROR: grype v${GRYPE_VERSION} resolves google.golang.org/grpc ${have}, not ${GRPC_FROM}." >&2; \
+      echo "       This override was written against ${GRPC_FROM}. If upstream now" >&2; \
+      echo "       ships >= ${GRPC_TO}, DELETE the override block in this stage." >&2; \
+      exit 1; \
+    fi; \
+    cp go.mod /tmp/go.mod.pre-grpc; \
+    go get "google.golang.org/grpc@${GRPC_TO}"; \
+    got="$(grpc_pin)"; \
+    if [ "${got}" != "${GRPC_TO}" ]; then \
+      echo "ERROR: override did not take: go.mod pins google.golang.org/grpc ${got}." >&2; \
+      exit 1; \
+    fi; \
+    moved="$(diff -u /tmp/go.mod.pre-grpc go.mod \
+             | sed -n 's|^+[[:space:]]*\([^ ]*\) v.*|\1|p' | sort -u | tr '\n' ' ')"; \
+    expected="cel.dev/expr github.com/GoogleCloudPlatform/opentelemetry-operations-go/detectors/gcp github.com/spiffe/go-spiffe/v2 go.opentelemetry.io/contrib/detectors/gcp go.opentelemetry.io/otel go.opentelemetry.io/otel/metric go.opentelemetry.io/otel/sdk go.opentelemetry.io/otel/sdk/metric go.opentelemetry.io/otel/trace google.golang.org/genproto/googleapis/api google.golang.org/genproto/googleapis/rpc google.golang.org/grpc "; \
+    if [ "${moved}" != "${expected}" ]; then \
+      echo "ERROR: go get moved an undeclared set of modules." >&2; \
+      echo "       expected: ${expected}" >&2; \
+      echo "       actual:   ${moved}" >&2; \
+      echo "       Re-review the override and update the declared set." >&2; \
+      exit 1; \
+    fi; \
+    rm -f /tmp/go.mod.pre-grpc; \
+    go mod verify; \
+    echo "grype build: override applied — google.golang.org/grpc ${GRPC_FROM} -> ${GRPC_TO}"
+
 RUN set -eu; \
     build_date="$(TZ=UTC git log -1 --format=%cd --date=format-local:%Y-%m-%dT%H:%M:%SZ)"; \
     CGO_ENABLED=0 GOOS="${TARGETOS}" GOARCH="${TARGETARCH}" \
@@ -182,7 +224,15 @@ RUN set -eu; \
       echo "       The Trivy gate reads this build info; the override did not ship (#3465)." >&2; \
       exit 1; \
     fi; \
-    echo "grype build: build info verified — golang.org/x/mod ${recorded} across ${deps} deps"
+    recorded_grpc="$(printf '%s\n' "${info}" \
+                | sed -n 's|^[[:space:]]*dep[[:space:]]*google\.golang\.org/grpc[[:space:]]*\(v[^[:space:]]*\).*|\1|p' \
+                | head -n1)"; \
+    if [ "${recorded_grpc}" != "${GRPC_TO}" ]; then \
+      echo "ERROR: compiled grype records google.golang.org/grpc '${recorded_grpc}', want ${GRPC_TO}." >&2; \
+      echo "       The Trivy gate reads this build info; the override did not ship." >&2; \
+      exit 1; \
+    fi; \
+    echo "grype build: build info verified — golang.org/x/mod ${recorded}, google.golang.org/grpc ${recorded_grpc}, across ${deps} deps"
 
 # ---------- Stage 4b: Pre-seed the Grype vulnerability DB ----------
 # Populates the Grype DB at build time so the image works on egress-restricted
