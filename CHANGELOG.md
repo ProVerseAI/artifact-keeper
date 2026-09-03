@@ -86,6 +86,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   One arm is **not** unified and is called out rather than hidden: a `users` row whose `password_hash` is not valid bcrypt — an imported account, or a placeholder — makes `verify_password` fail to parse it and answers `500`, not `401`. That is a data-integrity fault rather than a credential decision, it is not attacker-controllable (it requires a row that already exists in that state), and reporting it as a bad password would hide a broken account from the operator who has to fix it.
 
+## [1.8.2-proverse] - 2026-09-03
+
+The ProVerse build of 1.8.2, published as `ghcr.io/proverseai/artifact-keeper-backend:1.8.2-proverse`.
+It is upstream `1.8.2` plus the post-1.8.2 fixes listed under `[Unreleased]` above,
+plus the three storage/npm fixes below. Subsequent fixes on this line take
+`1.8.2-proverse.1`, `.2`, ... — a dashed prerelease identifier, so no floating
+tag (`:latest`, `:1.8`) is ever moved by a ProVerse cut.
+
+### Fixed
+
+- **Server-side S3 copies of large objects streamed through the application instead of using multipart copy.** The blob-finalize path promotes a staged object onto its digest key with a server-side copy; above the single-`CopyObject` ceiling this fell back to a read-and-rewrite through the backend, so every byte of a multi-gigabyte layer made a round trip. The copy is now issued as ranged `UploadPartCopy` slices sized adaptively to the object, and the destination only becomes visible once every part has copied — an aborted copy leaves an existing destination untouched.
+
+- **The S3 per-request timeout could not be raised past `object_store`'s internal cap.** `S3_BULK_TIMEOUT_SECS` sets the bulk client's request timeout, but `object_store` applies its own 180-second `retry_timeout` on top, so a transfer that legitimately needed longer was cut at 180 seconds no matter what the deployment configured. Both ceilings now move together, and the per-request timeout is environment-configurable rather than compiled in.
+
+- **`npm`-format metadata omitted the legacy `dist.shasum`, which Unity Package Manager requires.** UPM reads `dist.shasum` (SHA-1) and ignores `dist.integrity`, so a package served by this registry could not be installed from Unity even though every other npm client resolved it. Packuments now carry the legacy SHA-1 `dist.shasum` alongside the modern `dist.integrity`; clients that read `integrity` are unaffected.
+
+### Changed
+
+- **Images publish to `ghcr.io` only; the upstream Docker Hub mirror is removed.** The three merge jobs in `docker-publish.yml` no longer copy anything to `docker.io/artifactkeeper/*`, and the Docker Hub logins, metadata steps and mirror-side guards go with them — a removal rather than a `continue-on-error`, because `scripts/ci/check-supply-chain-soft-fail.sh` forbids any soft step in the publish workflow. The ghcr image names are spelled out in lowercase (`proverseai/artifact-keeper-*`) because ghcr.io rejects an uppercase repository path and `github.repository` is `ProVerseAI/artifact-keeper` here. Signing, provenance attestation and the published-tag signature verification are unchanged in kind and now cover the one registry that is actually written.
+
+  `scripts/ci/check-registry-publish-parity.sh` is generalised rather than dropped: it asked "does this job sign and verify both of the two registries it mirrors to", which is unanswerable once there is one. It now asks the question per registry the job actually pushes to, so it stays green on a single-registry publish and turns red on the pull request that adds a second registry without signing and verifying there too — which is how the defect it was written for (#3562) arose in the first place.
+
 ## [1.8.2] - 2026-09-01
 
 ### Added

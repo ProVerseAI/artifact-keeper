@@ -35,19 +35,19 @@ on:
         default: 'rc-candidate'
       # PROMOTE mode (#2698): complete a partially-published release without
       # rebuilding. Given a version already built on ghcr, resolve its published
-      # manifest-list digest and idempotently (re)apply every version tag and the
-      # Docker Hub mirror for all three images. The digest-aware guard still runs,
-      # so promote can only re-apply the SAME digest -- never replace it -- which
-      # is why it needs no manual tokens: it uses the pipeline's own credentials.
+      # manifest-list digest and idempotently (re)apply every version tag for
+      # all three images. The digest-aware guard still runs, so promote can only
+      # re-apply the SAME digest -- never replace it -- which is why it needs no
+      # manual tokens: it uses the pipeline's own credentials.
       promote_version:
-        description: 'PROMOTE: finish/re-apply a version already built on ghcr (e.g. 1.6.2) — re-applies all tags + the Docker Hub mirror for all three images WITHOUT rebuilding. Leave blank for a normal build.'
+        description: 'PROMOTE: finish/re-apply a version already built on ghcr (e.g. 1.6.2) — re-applies all tags for all three images WITHOUT rebuilding. Leave blank for a normal build.'
         required: false
         default: ''
       # POST-GATE FLOATING PROMOTION. Off by default, which is what keeps the
       # documented recovery dispatch (`-f promote_version=X.Y.Z` on its own)
       # byte-for-byte the operation it has always been: re-apply the exact
-      # version tag and mirror ghcr's CURRENT floating state to Docker Hub,
-      # never moving a floating tag.
+      # version tag and re-assert ghcr's CURRENT floating state, never moving a
+      # floating tag.
       #
       # Turned on, it lets the promote re-point `:latest` / `:X.Y` AT THE SAME
       # DIGEST the exact version tag already names, which is how release.yml
@@ -95,14 +95,16 @@ concurrency:
   group: docker-publish-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: false
 
+# ghcr.io rejects an uppercase repository path, and `github.repository` here
+# is `ProVerseAI/artifact-keeper` — so the derived names have to be spelled
+# out in lowercase rather than interpolated. The upstream Docker Hub mirror
+# (docker.io/artifactkeeper/*) is deliberately absent: this fork publishes to
+# ghcr.io only, so there are no DOCKERHUB_* image names to mirror to.
 env:
   REGISTRY: ghcr.io
-  BACKEND_IMAGE: ${{ github.repository }}-backend
-  OPENSCAP_IMAGE: ${{ github.repository }}-openscap
-  SCANNER_ADAPTER_IMAGE: ${{ github.repository }}-scanner-adapter
-  DOCKERHUB_BACKEND: artifactkeeper/backend
-  DOCKERHUB_OPENSCAP: artifactkeeper/openscap
-  DOCKERHUB_SCANNER_ADAPTER: artifactkeeper/scanner-adapter
+  BACKEND_IMAGE: proverseai/artifact-keeper-backend
+  OPENSCAP_IMAGE: proverseai/artifact-keeper-openscap
+  SCANNER_ADAPTER_IMAGE: proverseai/artifact-keeper-scanner-adapter
 
 jobs:
   publish-preflight:
@@ -113,7 +115,7 @@ jobs:
     # burn runner minutes. Every other job needs this one (directly or
     # transitively) without a status-check override, so skipping it skips the
     # whole run; the always()-gated summary job carries the same guard.
-    if: ${{ github.event_name != 'schedule' || github.repository == 'artifact-keeper/artifact-keeper' }}
+    if: ${{ github.event_name != 'schedule' || github.repository == 'ProVerseAI/artifact-keeper' }}
     permissions:
       contents: read
     outputs:
@@ -314,15 +316,13 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Authenticate to Docker Hub before buildx so transitive `FROM`
-      # statements that pull from docker.io (e.g., the alpine:3.24 stage
-      # used to pre-seed the Grype CVE DB inside Dockerfile.backend) are
-      # not subject to the 100-pull/6h anonymous rate limit.
-      - name: Log in to Docker Hub (for transitive base-image pulls)
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      # Upstream authenticated to Docker Hub here so transitive `FROM` pulls
+      # from docker.io escaped the 100-pull/6h anonymous limit. This fork has
+      # no Docker Hub credentials, and `docker/login-action` fails hard on
+      # empty ones — a soft `continue-on-error` is not available either, since
+      # scripts/ci/check-supply-chain-soft-fail.sh forbids ANY soft step in
+      # this workflow. Transitive base pulls run anonymously; a release cut
+      # makes far fewer than 100 of them.
 
       - name: Extract metadata
         id: meta
@@ -436,13 +436,8 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Authenticate to Docker Hub for transitive base-image pulls; see
-      # the matching step in build-backend for rationale.
-      - name: Log in to Docker Hub (for transitive base-image pulls)
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      # No Docker Hub login: transitive base-image pulls run anonymously here.
+      # See the matching note in build-backend.
 
       - name: Extract metadata
         id: meta
@@ -518,13 +513,8 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Authenticate to Docker Hub for transitive base-image pulls; see
-      # the matching step in build-backend for rationale.
-      - name: Log in to Docker Hub (for transitive base-image pulls)
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      # No Docker Hub login: transitive base-image pulls run anonymously here.
+      # See the matching note in build-backend.
 
       - name: Extract metadata
         id: meta
@@ -1162,12 +1152,6 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Log in to Docker Hub
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
       - name: Extract metadata (ghcr.io)
         id: meta
         if: ${{ env.PROMOTE_VERSION == '' }}
@@ -1183,29 +1167,15 @@ jobs:
             type=raw,value=${{ needs.publish-preflight.outputs.series_dev_tag }},enable=${{ needs.publish-preflight.outputs.series_dev_tag != '' }}
             type=raw,value=${{ needs.publish-preflight.outputs.dispatch_tag }},enable=${{ github.event_name == 'workflow_dispatch' && needs.publish-preflight.outputs.dispatch_tag != '' }}
 
-      - name: Extract metadata (Docker Hub)
-        id: meta-dockerhub
-        if: ${{ env.PROMOTE_VERSION == '' }}
-        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
-        with:
-          images: docker.io/${{ env.DOCKERHUB_BACKEND }}
-          tags: |
-            type=ref,event=branch
-            type=ref,event=pr
-            type=semver,pattern={{version}}
-            type=sha
-            type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', 'main') }}
-            type=raw,value=${{ needs.publish-preflight.outputs.series_dev_tag }},enable=${{ needs.publish-preflight.outputs.series_dev_tag != '' }}
-            type=raw,value=${{ needs.publish-preflight.outputs.dispatch_tag }},enable=${{ github.event_name == 'workflow_dispatch' && needs.publish-preflight.outputs.dispatch_tag != '' }}
-
-      # Resolve, for BOTH modes, the full ghcr + Docker Hub tag sets and the
-      # single "exact" version tag that must be guarded (empty for branch/pr/
-      # manual builds that publish no chart-pinned identity tag).
+      # Resolve, for BOTH modes, the ghcr tag set and the single "exact"
+      # version tag that must be guarded (empty for branch/pr/manual builds
+      # that publish no chart-pinned identity tag). ghcr.io is the only
+      # registry this fork publishes to; the upstream Docker Hub mirror is
+      # gone, so there is no second tag set to resolve.
       - name: Resolve publish plan
         id: plan
         env:
           META_JSON: ${{ steps.meta.outputs.json }}
-          META_HUB_JSON: ${{ steps.meta-dockerhub.outputs.json }}
           META_VERSION: ${{ steps.meta.outputs.version }}
           GH_REF: ${{ github.ref }}
         run: |
@@ -1220,19 +1190,17 @@ jobs:
             # publish -- the shape that let v1.7.2 put `:latest` on bytes no
             # gate ever ran against.
             VERSION="${PROMOTE_VERSION}"
-            GIMG="${REGISTRY}/${BACKEND_IMAGE}"; HIMG="docker.io/${DOCKERHUB_BACKEND}"
+            GIMG="${REGISTRY}/${BACKEND_IMAGE}"
             vdig=$(docker buildx imagetools inspect --format '{{json .Manifest}}' "${GIMG}:${VERSION}" 2>/dev/null | jq -r '.digest' 2>/dev/null || true)
             if [[ "${vdig}" != sha256:* ]]; then
               echo "::error title=Nothing to promote::${GIMG}:${VERSION} is not present on ghcr; cannot promote."; exit 1
             fi
-            ghcr=( "${GIMG}:${VERSION}" ); hub=( "${HIMG}:${VERSION}" )
+            ghcr=( "${GIMG}:${VERSION}" )
             printf '%s\n' "${ghcr[@]}" | jq -R . | jq -cs . > /tmp/ghcr-tags.json
-            printf '%s\n' "${hub[@]}"  | jq -R . | jq -cs . > /tmp/hub-tags.json
             echo "exact=${VERSION}" >> "$GITHUB_OUTPUT"
           else
             # NORMAL: tags come straight from docker/metadata-action.
             jq -c '.tags' <<< "${META_JSON}" > /tmp/ghcr-tags.json
-            jq -c '.tags' <<< "${META_HUB_JSON}" > /tmp/hub-tags.json
             # Only a clean release tag publishes a guarded exact identity tag.
             if [[ "${GH_REF}" == refs/tags/v* ]]; then
               echo "exact=${META_VERSION}" >> "$GITHUB_OUTPUT"
@@ -1241,7 +1209,6 @@ jobs:
             fi
           fi
           echo "ghcr tags:"; cat /tmp/ghcr-tags.json; echo
-          echo "hub tags:";  cat /tmp/hub-tags.json;  echo
 
       # Resolve the manifest-list digest this run will point the tags at, WITHOUT
       # writing the exact/floating tags first:
@@ -1279,8 +1246,8 @@ jobs:
       # Digest-aware republish guard (preserves the supply-chain property).
       #
       # Runs whenever an exact chart-pinned identity tag is being published
-      # (release tags AND promote), on BOTH registries this job writes to. The
-      # comparison, spelled out:
+      # (release tags AND promote), on ghcr.io — the only registry this job
+      # writes to. The comparison, spelled out:
       #   - tag absent            -> allow (fresh publish, or a partial-publish
       #                              this run is completing on the missing side).
       #   - tag == incoming digest -> allow (idempotent re-apply / promote no-op).
@@ -1290,22 +1257,18 @@ jobs:
       #                              tamper). This is the exact protection the old
       #                              "tag exists -> refuse" guard gave, kept intact.
       #   - state indeterminate    -> REFUSE (fail closed).
-      # This is what lets a partial publish (ghcr done, Docker Hub not) be
-      # completed by a re-run/promote while still forbidding a different-digest
-      # overwrite.
+      # This is what lets an interrupted publish be completed by a re-run or a
+      # promote while still forbidding a different-digest overwrite.
       - name: Refuse to overwrite a published backend version
         if: ${{ steps.plan.outputs.exact != '' }}
         env:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
         run: |
           set -euo pipefail
           .github/scripts/assert-version-digest-consistent.sh \
             "${{ steps.plan.outputs.exact }}" \
             "${{ steps.incoming.outputs.digest }}" \
-            "ghcr.io|${BACKEND_IMAGE}" \
-            "docker.io|${DOCKERHUB_BACKEND}"
+            "ghcr.io|${BACKEND_IMAGE}"
 
       # Apply (or re-apply) every ghcr tag at the resolved digest. Re-pointing a
       # tag to the SAME digest is a no-op, so this is safe to re-run.
@@ -1318,63 +1281,19 @@ jobs:
             "${REGISTRY}/${BACKEND_IMAGE}@${{ steps.incoming.outputs.digest }}"
           docker buildx imagetools inspect "${REGISTRY}/${BACKEND_IMAGE}@${{ steps.incoming.outputs.digest }}" >/dev/null
 
-      # Mirror to Docker Hub with retry. A transient PROTOCOL_ERROR/ETIMEDOUT on
-      # the Docker Hub side is exactly what left v1.6.2 half-published; because
-      # imagetools create re-points tags to the SAME digest, each retry is a safe
-      # no-op-or-complete rather than a re-publish.
-      - name: Copy to Docker Hub
-        run: |
-          set -euo pipefail
-          mapfile -t TAGS < <(jq -r '.[]' /tmp/hub-tags.json)
-          args=(); for t in "${TAGS[@]}"; do args+=( -t "$t" ); done
-          SRC="${REGISTRY}/${BACKEND_IMAGE}@${{ steps.incoming.outputs.digest }}"
-          n=0; max=5
-          until docker buildx imagetools create "${args[@]}" "${SRC}"; do
-            n=$((n + 1))
-            if [[ "$n" -ge "$max" ]]; then
-              echo "::error title=Docker Hub mirror failed::imagetools create to Docker Hub failed after ${max} attempts."
-              exit 1
-            fi
-            echo "Docker Hub copy attempt ${n}/${max} failed; retrying in $((n * 10))s..."
-            sleep $((n * 10))
-          done
-
-      # BOTH REGISTRIES, BECAUSE BOTH ARE PUBLISHED (#3562).
+      # A cosign signature lives in the repository it was pushed to, so the
+      # signature below covers this digest inside ghcr.io — the one registry
+      # this fork publishes to. Upstream signed a second time on
+      # docker.io/artifactkeeper/...; that mirror no longer exists here.
       #
-      # A cosign signature lives in the repository it was pushed to. The ghcr
-      # signature below covers this digest inside
-      # `ghcr.io/artifact-keeper/...`; it is invisible to anyone verifying
-      # `docker.io/artifactkeeper/...`, even though the "Copy to Docker Hub"
-      # step above put byte-identical content there. Until this second line
-      # existed, every Docker Hub tag this project ever published was
-      # unverifiable -- the bytes were right, the signature simply was not
-      # there to find.
-      #
-      # The subject is the DIGEST on both sides, and it is the SAME digest:
-      # `imagetools create` copies a manifest list without rewriting it, so
-      # ghcr and Docker Hub resolve a given tag to identical bytes (measured
-      # on 1.8.1 for all three images). Signing by digest is therefore also a
-      # self-assertion -- if the Hub copy had produced different content, this
-      # `cosign sign` would fail on a manifest that is not there, loudly and
-      # immediately, rather than attaching a signature to the wrong thing.
-      #
-      # Signing the digest rather than a tag is likewise what lets
-      # `apply-floating-tags` stay build-free: it re-points `:latest` / `:X.Y`
-      # on both registries at this same digest and uploads nothing, so this
-      # signature keeps covering them.
-      #
-      # SURFACE NOTE: unlike ghcr.io, Docker Hub implements the OCI referrers
-      # API, and on Hub the referrer index is also addressable as the
-      # `sha256-<digest>` tag. Expect that tag to become visible in the PUBLIC
-      # Docker Hub repository's tag list. That is a deliberate, accepted
-      # trade -- see #3562.
+      # Signing the digest rather than a tag is what lets `apply-floating-tags`
+      # stay build-free: it re-points `:latest` / `:X.Y` at this same digest
+      # and uploads nothing, so this signature keeps covering them.
       - name: Sign image with cosign (keyless)
         run: |
           set -euo pipefail
           cosign sign --yes \
             ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}@${{ steps.incoming.outputs.digest }}
-          cosign sign --yes \
-            docker.io/${{ env.DOCKERHUB_BACKEND }}@${{ steps.incoming.outputs.digest }}
 
       # CONTROL, not telemetry (#3496). This step carried
       # `continue-on-error: true` from the day it was added, so a failed
@@ -1439,26 +1358,22 @@ jobs:
       # Both fail the job; every step in this job is idempotent, so recovery
       # is "Re-run failed jobs".
       #
-      # BOTH REGISTRIES (#3562). A gate pointed at one of the two channels this
-      # workflow publishes to is precisely the hole it exists to close: the
-      # Docker Hub mirrors shipped unsigned for the project's entire history
-      # while a correct, hard-failing, well-tested ghcr check stayed green over
-      # them. The Docker Hub tag set goes in alongside the ghcr one.
+      # PUBLISHED_SIG_BASIC_AUTH_HOST pins the ghcr credential below to ghcr:
+      # the token endpoint a registry credential gets presented to is named by
+      # a WWW-Authenticate header the REGISTRY sends, so the pin is what stops
+      # a GITHUB_TOKEN being offered to some other auth server.
       #
-      # PUBLISHED_SIG_BASIC_AUTH_HOST pins the ghcr credential below to ghcr.
-      # The token endpoint a registry credential gets presented to is named by
-      # a WWW-Authenticate header the REGISTRY sends, and Docker Hub's realm is
-      # auth.docker.io -- a different origin. Without the pin, adding a
-      # docker.io ref to this invocation would hand a GITHUB_TOKEN to Docker's
-      # auth server. Public mirrors resolve anonymously, so nothing is lost.
+      # The identity regexp names THIS repository. It is half the assertion --
+      # anyone can sign any public image with Sigstore -- so it must track the
+      # fork that actually signs (ProVerseAI), not upstream.
       - name: Verify the published tags resolve to signed bytes
         env:
-          PUBLISHED_SIG_IDENTITY_REGEXP: ^https://github\.com/artifact-keeper/artifact-keeper/\.github/workflows/docker-publish\.yml@refs/(heads|tags)/.+$
+          PUBLISHED_SIG_IDENTITY_REGEXP: ^https://github\.com/ProVerseAI/artifact-keeper/\.github/workflows/docker-publish\.yml@refs/(heads|tags)/.+$
           PUBLISHED_SIG_BASIC_AUTH: ${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}
           PUBLISHED_SIG_BASIC_AUTH_HOST: ghcr.io
         run: |
           set -euo pipefail
-          mapfile -t REFS < <(jq -r '.[]' /tmp/ghcr-tags.json /tmp/hub-tags.json)
+          mapfile -t REFS < <(jq -r '.[]' /tmp/ghcr-tags.json)
           scripts/ci/check-published-image-signature.sh "${REFS[@]}"
 
       # .vex was fetched by the checkout at the top of this job.
@@ -1549,12 +1464,6 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Log in to Docker Hub
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
       - name: Extract metadata (ghcr.io)
         id: meta
         if: ${{ env.PROMOTE_VERSION == '' }}
@@ -1570,28 +1479,12 @@ jobs:
             type=raw,value=${{ needs.publish-preflight.outputs.series_dev_tag }},enable=${{ needs.publish-preflight.outputs.series_dev_tag != '' }}
             type=raw,value=${{ needs.publish-preflight.outputs.dispatch_tag }},enable=${{ github.event_name == 'workflow_dispatch' && needs.publish-preflight.outputs.dispatch_tag != '' }}
 
-      - name: Extract metadata (Docker Hub)
-        id: meta-dockerhub
-        if: ${{ env.PROMOTE_VERSION == '' }}
-        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
-        with:
-          images: docker.io/${{ env.DOCKERHUB_OPENSCAP }}
-          tags: |
-            type=ref,event=branch
-            type=ref,event=pr
-            type=semver,pattern={{version}}
-            type=sha
-            type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', 'main') }}
-            type=raw,value=${{ needs.publish-preflight.outputs.series_dev_tag }},enable=${{ needs.publish-preflight.outputs.series_dev_tag != '' }}
-            type=raw,value=${{ needs.publish-preflight.outputs.dispatch_tag }},enable=${{ github.event_name == 'workflow_dispatch' && needs.publish-preflight.outputs.dispatch_tag != '' }}
-
-      # See merge-backend for the full rationale of the plan/anchor/guard/apply/
-      # mirror sequence. Same shape, OpenSCAP image.
+      # See merge-backend for the full rationale of the plan/anchor/guard/apply
+      # sequence. Same shape, OpenSCAP image.
       - name: Resolve publish plan
         id: plan
         env:
           META_JSON: ${{ steps.meta.outputs.json }}
-          META_HUB_JSON: ${{ steps.meta-dockerhub.outputs.json }}
           META_VERSION: ${{ steps.meta.outputs.version }}
           GH_REF: ${{ github.ref }}
         run: |
@@ -1600,18 +1493,16 @@ jobs:
             # Exact identity tag only; floating tags belong to
             # `apply-floating-tags`. See merge-backend.
             VERSION="${PROMOTE_VERSION}"
-            GIMG="${REGISTRY}/${OPENSCAP_IMAGE}"; HIMG="docker.io/${DOCKERHUB_OPENSCAP}"
+            GIMG="${REGISTRY}/${OPENSCAP_IMAGE}"
             vdig=$(docker buildx imagetools inspect --format '{{json .Manifest}}' "${GIMG}:${VERSION}" 2>/dev/null | jq -r '.digest' 2>/dev/null || true)
             if [[ "${vdig}" != sha256:* ]]; then
               echo "::error title=Nothing to promote::${GIMG}:${VERSION} is not present on ghcr; cannot promote."; exit 1
             fi
-            ghcr=( "${GIMG}:${VERSION}" ); hub=( "${HIMG}:${VERSION}" )
+            ghcr=( "${GIMG}:${VERSION}" )
             printf '%s\n' "${ghcr[@]}" | jq -R . | jq -cs . > /tmp/ghcr-tags.json
-            printf '%s\n' "${hub[@]}"  | jq -R . | jq -cs . > /tmp/hub-tags.json
             echo "exact=${VERSION}" >> "$GITHUB_OUTPUT"
           else
             jq -c '.tags' <<< "${META_JSON}" > /tmp/ghcr-tags.json
-            jq -c '.tags' <<< "${META_HUB_JSON}" > /tmp/hub-tags.json
             if [[ "${GH_REF}" == refs/tags/v* ]]; then
               echo "exact=${META_VERSION}" >> "$GITHUB_OUTPUT"
             else
@@ -1619,7 +1510,6 @@ jobs:
             fi
           fi
           echo "ghcr tags:"; cat /tmp/ghcr-tags.json; echo
-          echo "hub tags:";  cat /tmp/hub-tags.json;  echo
 
       - name: Resolve incoming digest
         id: incoming
@@ -1651,15 +1541,12 @@ jobs:
         if: ${{ steps.plan.outputs.exact != '' }}
         env:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
         run: |
           set -euo pipefail
           .github/scripts/assert-version-digest-consistent.sh \
             "${{ steps.plan.outputs.exact }}" \
             "${{ steps.incoming.outputs.digest }}" \
-            "ghcr.io|${OPENSCAP_IMAGE}" \
-            "docker.io|${DOCKERHUB_OPENSCAP}"
+            "ghcr.io|${OPENSCAP_IMAGE}"
 
       - name: Apply ghcr tags
         run: |
@@ -1670,33 +1557,12 @@ jobs:
             "${REGISTRY}/${OPENSCAP_IMAGE}@${{ steps.incoming.outputs.digest }}"
           docker buildx imagetools inspect "${REGISTRY}/${OPENSCAP_IMAGE}@${{ steps.incoming.outputs.digest }}" >/dev/null
 
-      - name: Copy to Docker Hub
-        run: |
-          set -euo pipefail
-          mapfile -t TAGS < <(jq -r '.[]' /tmp/hub-tags.json)
-          args=(); for t in "${TAGS[@]}"; do args+=( -t "$t" ); done
-          SRC="${REGISTRY}/${OPENSCAP_IMAGE}@${{ steps.incoming.outputs.digest }}"
-          n=0; max=5
-          until docker buildx imagetools create "${args[@]}" "${SRC}"; do
-            n=$((n + 1))
-            if [[ "$n" -ge "$max" ]]; then
-              echo "::error title=Docker Hub mirror failed::imagetools create to Docker Hub failed after ${max} attempts."
-              exit 1
-            fi
-            echo "Docker Hub copy attempt ${n}/${max} failed; retrying in $((n * 10))s..."
-            sleep $((n * 10))
-          done
-
-      # Both registries; see the long note on the same step in merge-backend
-      # (#3562). Same digest on each -- the Docker Hub copy above re-points
-      # tags at bytes it did not rewrite.
+      # ghcr.io only; see the note on the same step in merge-backend.
       - name: Sign image with cosign (keyless)
         run: |
           set -euo pipefail
           cosign sign --yes \
             ${{ env.REGISTRY }}/${{ env.OPENSCAP_IMAGE }}@${{ steps.incoming.outputs.digest }}
-          cosign sign --yes \
-            docker.io/${{ env.DOCKERHUB_OPENSCAP }}@${{ steps.incoming.outputs.digest }}
 
       # CONTROL, not telemetry (#3496) — see the long note on the same step
       # in merge-backend. No continue-on-error: a provenance push that fails
@@ -1712,26 +1578,22 @@ jobs:
       # there (#3559). Anchored to the published tag, never to the digest this
       # job handed the signer.
       #
-      # BOTH REGISTRIES (#3562). A gate pointed at one of the two channels this
-      # workflow publishes to is precisely the hole it exists to close: the
-      # Docker Hub mirrors shipped unsigned for the project's entire history
-      # while a correct, hard-failing, well-tested ghcr check stayed green over
-      # them. The Docker Hub tag set goes in alongside the ghcr one.
+      # PUBLISHED_SIG_BASIC_AUTH_HOST pins the ghcr credential below to ghcr:
+      # the token endpoint a registry credential gets presented to is named by
+      # a WWW-Authenticate header the REGISTRY sends, so the pin is what stops
+      # a GITHUB_TOKEN being offered to some other auth server.
       #
-      # PUBLISHED_SIG_BASIC_AUTH_HOST pins the ghcr credential below to ghcr.
-      # The token endpoint a registry credential gets presented to is named by
-      # a WWW-Authenticate header the REGISTRY sends, and Docker Hub's realm is
-      # auth.docker.io -- a different origin. Without the pin, adding a
-      # docker.io ref to this invocation would hand a GITHUB_TOKEN to Docker's
-      # auth server. Public mirrors resolve anonymously, so nothing is lost.
+      # The identity regexp names THIS repository. It is half the assertion --
+      # anyone can sign any public image with Sigstore -- so it must track the
+      # fork that actually signs (ProVerseAI), not upstream.
       - name: Verify the published tags resolve to signed bytes
         env:
-          PUBLISHED_SIG_IDENTITY_REGEXP: ^https://github\.com/artifact-keeper/artifact-keeper/\.github/workflows/docker-publish\.yml@refs/(heads|tags)/.+$
+          PUBLISHED_SIG_IDENTITY_REGEXP: ^https://github\.com/ProVerseAI/artifact-keeper/\.github/workflows/docker-publish\.yml@refs/(heads|tags)/.+$
           PUBLISHED_SIG_BASIC_AUTH: ${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}
           PUBLISHED_SIG_BASIC_AUTH_HOST: ghcr.io
         run: |
           set -euo pipefail
-          mapfile -t REFS < <(jq -r '.[]' /tmp/ghcr-tags.json /tmp/hub-tags.json)
+          mapfile -t REFS < <(jq -r '.[]' /tmp/ghcr-tags.json)
           scripts/ci/check-published-image-signature.sh "${REFS[@]}"
 
   merge-scanner-adapter:
@@ -1815,12 +1677,6 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Log in to Docker Hub
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
       # Two different tags with two different jobs:
       #
       #   exact (1.2.1)          identity. Published once, never re-pointed.
@@ -1843,8 +1699,6 @@ jobs:
           STABLE_REQUESTED: ${{ steps.adapter_version.outputs.stable_requested }}
           IMAGE: ${{ env.REGISTRY }}/${{ env.SCANNER_ADAPTER_IMAGE }}
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
         run: |
           set -euo pipefail
 
@@ -1861,42 +1715,30 @@ jobs:
             exit 0
           fi
 
-          # Ask both registries, because this job writes to both. ghcr.io
-          # answering "absent" says nothing about docker.io -- and deleting a
-          # ghcr package version is a routine admin action, which must not
-          # become permission to overwrite a published Docker Hub tag.
+          # ghcr.io is the only registry this job writes to, so it is the only
+          # one asked. Upstream cross-checked docker.io here as well, because a
+          # ghcr package version can be deleted by a routine admin action and
+          # that must not become permission to overwrite a published mirror
+          # tag; with the mirror gone there is no second answer to disagree
+          # with, and an indeterminate lookup still fails closed.
           PROBE=.github/scripts/registry-tag-state.sh
           GHCR_STATE=$("$PROBE" ghcr.io "${SCANNER_ADAPTER_IMAGE}" "$ADAPTER_VERSION" || true)
-          HUB_STATE=$("$PROBE" docker.io "${DOCKERHUB_SCANNER_ADAPTER}" "$ADAPTER_VERSION" || true)
-          echo "Adapter ${ADAPTER_VERSION}: ghcr.io=${GHCR_STATE}, docker.io=${HUB_STATE}"
+          echo "Adapter ${ADAPTER_VERSION}: ghcr.io=${GHCR_STATE}"
 
-          if [[ "$GHCR_STATE" == "indeterminate" || "$HUB_STATE" == "indeterminate" ]]; then
-            echo "::error title=Adapter registry lookup inconclusive::Unable to prove whether ${ADAPTER_VERSION} is already published (ghcr.io=${GHCR_STATE}, docker.io=${HUB_STATE}); failing closed rather than risk replacing a published tag."
+          if [[ "$GHCR_STATE" == "indeterminate" ]]; then
+            echo "::error title=Adapter registry lookup inconclusive::Unable to prove whether ${ADAPTER_VERSION} is already published (ghcr.io=${GHCR_STATE}); failing closed rather than risk replacing a published tag."
             exit 1
           fi
 
-          if [[ "$GHCR_STATE" == "absent" && "$HUB_STATE" == "absent" ]]; then
+          if [[ "$GHCR_STATE" == "absent" ]]; then
             publish_exact=true
             publish_floating=true
-            echo "Scanner-adapter ${ADAPTER_VERSION} is new on both registries; exact and floating tags will be created."
+            echo "Scanner-adapter ${ADAPTER_VERSION} is new on ghcr.io; exact and floating tags will be created."
             finish
             exit 0
           fi
 
-          if [[ "$GHCR_STATE" != "$HUB_STATE" ]]; then
-            # One registry has the exact tag, the other does not -- typically a
-            # partial publish whose Docker Hub mirror died mid-run. A fresh build
-            # must NOT resolve that by re-pushing the exact tag (a rebuild has a
-            # new digest and would move the tag that is meant to be immutable), so
-            # this path still fails closed. The digest-safe way to finish it is
-            # the PROMOTE dispatch, which re-applies the ALREADY-published digest:
-            #   gh workflow run docker-publish.yml -f promote_version=<AK version>
-            # run from the release commit. See the promote path below.
-            echo "::error title=Adapter registries disagree::${ADAPTER_VERSION} is ${GHCR_STATE} on ghcr.io but ${HUB_STATE} on docker.io — likely a partial publish. A rebuild will not re-point the immutable exact tag. Complete it with the promote dispatch (promote_version=<AK version>, run from the release commit), which re-applies the published digest."
-            exit 1
-          fi
-
-          # Present on both. The exact tag stays where it is; decide whether the
+          # Present. The exact tag stays where it is; decide whether the
           # floating tags may follow this rebuild.
           EXACT_REF="${IMAGE}:${ADAPTER_VERSION}"
           MANIFEST_JSON=$(docker buildx imagetools inspect --format '{{json .Manifest}}' "$EXACT_REF")
@@ -1948,22 +1790,6 @@ jobs:
             type=raw,value=${{ needs.publish-preflight.outputs.series_dev_tag }},enable=${{ needs.publish-preflight.outputs.series_dev_tag != '' }}
             type=raw,value=${{ needs.publish-preflight.outputs.dispatch_tag }},enable=${{ github.event_name == 'workflow_dispatch' && needs.publish-preflight.outputs.dispatch_tag != '' }}
 
-      - name: Extract metadata (Docker Hub)
-        id: meta-dockerhub
-        if: ${{ env.PROMOTE_VERSION == '' }}
-        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
-        with:
-          images: docker.io/${{ env.DOCKERHUB_SCANNER_ADAPTER }}
-          # Mirror of the ghcr.io tag set above: adapter's own VERSION, not the
-          # AK git-tag semver. Same tags published to both registries; the
-          # floating tags are added later by `apply-floating-tags`.
-          tags: |
-            type=raw,value=${{ steps.adapter_version.outputs.version }},enable=${{ steps.adapter_publish.outputs.publish_exact == 'true' }}
-            type=sha
-            type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', 'main') }}
-            type=raw,value=${{ needs.publish-preflight.outputs.series_dev_tag }},enable=${{ needs.publish-preflight.outputs.series_dev_tag != '' }}
-            type=raw,value=${{ needs.publish-preflight.outputs.dispatch_tag }},enable=${{ github.event_name == 'workflow_dispatch' && needs.publish-preflight.outputs.dispatch_tag != '' }}
-
       - name: Create manifest list and push (ghcr.io)
         if: ${{ env.PROMOTE_VERSION == '' }}
         working-directory: /tmp/digests
@@ -1986,42 +1812,11 @@ jobs:
             ${{ env.REGISTRY }}/${{ env.SCANNER_ADAPTER_IMAGE }}:${{ steps.meta.outputs.version }} | jq -r '.digest')
           echo "digest=${DIGEST}" >> $GITHUB_OUTPUT
 
-      # Carry the same annotations the ghcr.io index gets. The source-revision
-      # annotation is what the publication decision above reads back to tell an
-      # unchanged-source rebuild from a version collision, so a Docker Hub index
-      # without it would have no provenance anchor at all.
-      - name: Copy to Docker Hub
-        if: ${{ env.PROMOTE_VERSION == '' }}
-        env:
-          ADAPTER_VERSION: ${{ steps.adapter_version.outputs.version }}
-          DOCKER_METADATA_OUTPUT_JSON: ${{ steps.meta-dockerhub.outputs.json }}
-        run: |
-          set -euo pipefail
-          # Retry the cross-registry copy: a transient PROTOCOL_ERROR/ETIMEDOUT on
-          # the Docker Hub side is what leaves a release half-published. imagetools
-          # create re-points tags to the SAME digest, so each retry is a safe
-          # no-op-or-complete.
-          # shellcheck disable=SC2046  # tag args are intentionally word-split
-          n=0; max=5
-          until docker buildx imagetools create \
-            --annotation "index:org.opencontainers.image.revision=${GITHUB_SHA}" \
-            --annotation "index:org.opencontainers.image.version=${ADAPTER_VERSION}" \
-            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            ${{ env.REGISTRY }}/${{ env.SCANNER_ADAPTER_IMAGE }}@${{ steps.inspect.outputs.digest }}; do
-            n=$((n + 1))
-            if [[ "$n" -ge "$max" ]]; then
-              echo "::error title=Docker Hub mirror failed::imagetools create to Docker Hub failed after ${max} attempts."
-              exit 1
-            fi
-            echo "Docker Hub copy attempt ${n}/${max} failed; retrying in $((n * 10))s..."
-            sleep $((n * 10))
-          done
-
       # ── PROMOTE path (#2698) ──────────────────────────────────────────────
-      # Re-apply the adapter's already-published version + floating tags and the
-      # Docker Hub mirror WITHOUT rebuilding, to finish a partial publish. The
-      # exact tag is only ever re-pointed to its OWN published digest, and the
-      # digest-aware guard enforces that.
+      # Re-apply the adapter's already-published version + floating tags WITHOUT
+      # rebuilding, to finish a partial publish. The exact tag is only ever
+      # re-pointed to its OWN published digest, and the digest-aware guard
+      # enforces that.
       - name: Promote — resolve published adapter digest
         id: promote_digest
         if: ${{ env.PROMOTE_VERSION != '' }}
@@ -2045,17 +1840,14 @@ jobs:
         if: ${{ env.PROMOTE_VERSION != '' }}
         env:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
         run: |
           set -euo pipefail
           .github/scripts/assert-version-digest-consistent.sh \
             "${{ steps.adapter_version.outputs.version }}" \
             "${{ steps.promote_digest.outputs.digest }}" \
-            "ghcr.io|${SCANNER_ADAPTER_IMAGE}" \
-            "docker.io|${DOCKERHUB_SCANNER_ADAPTER}"
+            "ghcr.io|${SCANNER_ADAPTER_IMAGE}"
 
-      - name: Promote — re-apply adapter tags (ghcr + Docker Hub)
+      - name: Promote — re-apply adapter tags (ghcr)
         if: ${{ env.PROMOTE_VERSION != '' }}
         env:
           V: ${{ steps.adapter_version.outputs.version }}
@@ -2063,35 +1855,18 @@ jobs:
         run: |
           set -euo pipefail
           GIMG="${REGISTRY}/${SCANNER_ADAPTER_IMAGE}"
-          HIMG="docker.io/${DOCKERHUB_SCANNER_ADAPTER}"
           # Exact identity tag only, guarded to the same digest. The adapter's
           # floating line (X.Y / X / latest) is re-applied by
           # `apply-floating-tags`, which runs after all three merge jobs.
-          gargs=( -t "${GIMG}:${V}" ); hargs=( -t "${HIMG}:${V}" )
-          docker buildx imagetools create "${gargs[@]}" "${GIMG}@${DIGEST}"
-          n=0; max=5
-          until docker buildx imagetools create "${hargs[@]}" "${GIMG}@${DIGEST}"; do
-            n=$((n + 1))
-            if [[ "$n" -ge "$max" ]]; then
-              echo "::error title=Docker Hub mirror failed::adapter promote to Docker Hub failed after ${max} attempts."
-              exit 1
-            fi
-            echo "Docker Hub copy attempt ${n}/${max} failed; retrying in $((n * 10))s..."
-            sleep $((n * 10))
-          done
+          docker buildx imagetools create -t "${GIMG}:${V}" "${GIMG}@${DIGEST}"
 
-      # Both registries; see the long note on the same step in merge-backend
-      # (#3562). The adapter's Docker Hub copy re-applies the same index
-      # annotations the ghcr push used, which is idempotent -- both registries
-      # resolve the adapter's tags to one digest (measured), so one digest is
-      # the subject on both sides.
+      # ghcr.io only; see the note on the same step in merge-backend.
       - name: Sign image with cosign (keyless)
         env:
           DIGEST: ${{ steps.inspect.outputs.digest || steps.promote_digest.outputs.digest }}
         run: |
           set -euo pipefail
           cosign sign --yes "${REGISTRY}/${SCANNER_ADAPTER_IMAGE}@${DIGEST}"
-          cosign sign --yes "docker.io/${DOCKERHUB_SCANNER_ADAPTER}@${DIGEST}"
 
       # CONTROL, not telemetry (#3496) — see the long note on the same step
       # in merge-backend. No continue-on-error: a provenance push that fails
@@ -2108,33 +1883,21 @@ jobs:
       # on a normal build and is the single exact version tag on a promote,
       # which is exactly what the steps above wrote.
       #
-      # BOTH REGISTRIES (#3562). A gate pointed at one of the two channels this
-      # workflow publishes to is precisely the hole it exists to close: the
-      # Docker Hub mirrors shipped unsigned for the project's entire history
-      # while a correct, hard-failing, well-tested ghcr check stayed green over
-      # them. The Docker Hub tag set goes in alongside the ghcr one.
-      #
-      # PUBLISHED_SIG_BASIC_AUTH_HOST pins the ghcr credential below to ghcr.
-      # The token endpoint a registry credential gets presented to is named by
-      # a WWW-Authenticate header the REGISTRY sends, and Docker Hub's realm is
-      # auth.docker.io -- a different origin. Without the pin, adding a
-      # docker.io ref to this invocation would hand a GITHUB_TOKEN to Docker's
-      # auth server. Public mirrors resolve anonymously, so nothing is lost.
+      # PUBLISHED_SIG_BASIC_AUTH_HOST pins the ghcr credential below to ghcr;
+      # the identity regexp names THIS repository. See merge-backend.
       - name: Verify the published tags resolve to signed bytes
         env:
           META_JSON: ${{ steps.meta.outputs.json }}
-          META_HUB_JSON: ${{ steps.meta-dockerhub.outputs.json }}
           ADAPTER_VERSION: ${{ steps.adapter_version.outputs.version }}
-          PUBLISHED_SIG_IDENTITY_REGEXP: ^https://github\.com/artifact-keeper/artifact-keeper/\.github/workflows/docker-publish\.yml@refs/(heads|tags)/.+$
+          PUBLISHED_SIG_IDENTITY_REGEXP: ^https://github\.com/ProVerseAI/artifact-keeper/\.github/workflows/docker-publish\.yml@refs/(heads|tags)/.+$
           PUBLISHED_SIG_BASIC_AUTH: ${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}
           PUBLISHED_SIG_BASIC_AUTH_HOST: ghcr.io
         run: |
           set -euo pipefail
           if [[ -n "${PROMOTE_VERSION}" ]]; then
-            REFS=( "${REGISTRY}/${SCANNER_ADAPTER_IMAGE}:${ADAPTER_VERSION}"
-                   "docker.io/${DOCKERHUB_SCANNER_ADAPTER}:${ADAPTER_VERSION}" )
+            REFS=( "${REGISTRY}/${SCANNER_ADAPTER_IMAGE}:${ADAPTER_VERSION}" )
           else
-            mapfile -t REFS < <(jq -r '.tags[]' <<< "${META_JSON}"; jq -r '.tags[]' <<< "${META_HUB_JSON}")
+            mapfile -t REFS < <(jq -r '.tags[]' <<< "${META_JSON}")
           fi
           scripts/ci/check-published-image-signature.sh "${REFS[@]}"
 
@@ -2172,35 +1935,11 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Log in to Docker Hub
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
       - name: Extract metadata (ghcr.io)
         id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}
-          flavor: |
-            suffix=-alpine
-          tags: |
-            type=ref,event=branch
-            type=ref,event=pr
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=sha
-            type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', 'main') }}
-            type=raw,value=${{ needs.publish-preflight.outputs.series_dev_tag }},enable=${{ needs.publish-preflight.outputs.series_dev_tag != '' }}
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-') }}
-            type=raw,value=${{ needs.publish-preflight.outputs.dispatch_tag }},enable=${{ github.event_name == 'workflow_dispatch' && needs.publish-preflight.outputs.dispatch_tag != '' }}
-
-      - name: Extract metadata (Docker Hub)
-        id: meta-dockerhub
-        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
-        with:
-          images: docker.io/${{ env.DOCKERHUB_BACKEND }}
           flavor: |
             suffix=-alpine
           tags: |
@@ -2229,12 +1968,6 @@ jobs:
           DIGEST=$(docker buildx imagetools inspect --format '{{json .Manifest}}' \
             ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}:${{ steps.meta.outputs.version }} | jq -r '.digest')
           echo "digest=${DIGEST}" >> $GITHUB_OUTPUT
-
-      - name: Copy to Docker Hub
-        run: |
-          docker buildx imagetools create \
-            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< '${{ steps.meta-dockerhub.outputs.json }}') \
-            ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}@${{ steps.inspect.outputs.digest }}
 
       - name: Sign image with cosign (keyless)
         run: |
@@ -2362,12 +2095,6 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Log in to Docker Hub
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
       # Produces /tmp/floating-plan.txt, one `<image>|<digest>|<tag>` line per
       # tag to write. Deciding first and writing second keeps the whole plan
       # visible in the log even on the (common) do-nothing paths.
@@ -2385,15 +2112,17 @@ jobs:
               | jq -r '.digest' 2>/dev/null || true
           }
 
-          # plan <ghcr-image> <hub-image> <digest> <mode> <tag>...
+          # plan <ghcr-image> <digest> <mode> <tag>...
           #   advance - write the tag at <digest> unconditionally (the caller
           #             has already established that it is allowed to move).
           #   mirror  - write the tag ONLY where ghcr ALREADY has it at
-          #             <digest>. This is the historic promote behaviour: copy
-          #             ghcr's CURRENT state to a registry that is missing it,
-          #             never move a floating tag.
+          #             <digest>. This is the historic promote behaviour: it
+          #             re-asserts ghcr's CURRENT state, never moves a tag.
+          #             It kept a second registry in step with ghcr; with the
+          #             Docker Hub mirror gone the mode is a no-op guard, and
+          #             is kept so the promote path behaves as documented.
           plan() {
-            local gimg="$1" himg="$2" digest="$3" mode="$4"; shift 4
+            local gimg="$1" digest="$2" mode="$3"; shift 3
             local t cur
             for t in "$@"; do
               [[ -n "$t" ]] || continue
@@ -2408,13 +2137,12 @@ jobs:
                 echo "  ${gimg}:${t} -> ${digest} (advance)"
               fi
               printf '%s|%s|%s\n' "${gimg}" "${digest}" "${t}" >> /tmp/floating-plan.txt
-              printf '%s|%s|%s\n' "${himg}" "${digest}" "${t}" >> /tmp/floating-plan.txt
             done
           }
 
-          GB="${REGISTRY}/${BACKEND_IMAGE}";         HB="docker.io/${DOCKERHUB_BACKEND}"
-          GO="${REGISTRY}/${OPENSCAP_IMAGE}";        HO="docker.io/${DOCKERHUB_OPENSCAP}"
-          GS="${REGISTRY}/${SCANNER_ADAPTER_IMAGE}"; HS="docker.io/${DOCKERHUB_SCANNER_ADAPTER}"
+          GB="${REGISTRY}/${BACKEND_IMAGE}"
+          GO="${REGISTRY}/${OPENSCAP_IMAGE}"
+          GS="${REGISTRY}/${SCANNER_ADAPTER_IMAGE}"
 
           # ── backend + openscap: the AK-versioned floating line ─────────────
           if [[ "${ADVANCE_FLOATING}" == "true" ]]; then
@@ -2451,8 +2179,8 @@ jobs:
             if [[ "${#FT[@]}" -eq 0 ]]; then
               echo "::notice title=No floating tag advances::${PROMOTE_VERSION} is newest in neither its series nor overall; :latest and :X.Y stay where they are."
             fi
-            plan "$GB" "$HB" "${BACKEND_DIGEST}"  advance ${FT[@]+"${FT[@]}"}
-            plan "$GO" "$HO" "${OPENSCAP_DIGEST}" advance ${FT[@]+"${FT[@]}"}
+            plan "$GB" "${BACKEND_DIGEST}"  advance ${FT[@]+"${FT[@]}"}
+            plan "$GO" "${OPENSCAP_DIGEST}" advance ${FT[@]+"${FT[@]}"}
           elif [[ -n "${PROMOTE_VERSION}" ]]; then
             # Plain promote (the documented recovery dispatch). Unchanged
             # behaviour: mirror ghcr's current floating state, move nothing.
@@ -2464,8 +2192,8 @@ jobs:
             if [[ "${PROMOTE_VERSION}" == *-* ]]; then
               echo "  prerelease ${PROMOTE_VERSION}: no AK floating tags exist to mirror."
             else
-              plan "$GB" "$HB" "${BACKEND_DIGEST}"  mirror "${PROMOTE_VERSION%.*}" latest
-              plan "$GO" "$HO" "${OPENSCAP_DIGEST}" mirror "${PROMOTE_VERSION%.*}" latest
+              plan "$GB" "${BACKEND_DIGEST}"  mirror "${PROMOTE_VERSION%.*}" latest
+              plan "$GO" "${OPENSCAP_DIGEST}" mirror "${PROMOTE_VERSION%.*}" latest
             fi
           else
             echo "Normal build: backend/openscap floating tags are NOT applied here."
@@ -2476,10 +2204,10 @@ jobs:
           # ── scanner-adapter: its own independent floating line ─────────────
           # Not gate-deferred; see this job's header for why.
           if [[ -n "${PROMOTE_VERSION}" ]]; then
-            plan "$GS" "$HS" "${ADAPTER_DIGEST}" mirror \
+            plan "$GS" "${ADAPTER_DIGEST}" mirror \
               "${ADAPTER_VERSION%.*}" "${ADAPTER_VERSION%%.*}" latest
           elif [[ "${ADAPTER_FLOATING}" == "true" ]]; then
-            plan "$GS" "$HS" "${ADAPTER_DIGEST}" advance \
+            plan "$GS" "${ADAPTER_DIGEST}" advance \
               "${ADAPTER_VERSION%.*}" "${ADAPTER_VERSION%%.*}" latest
           else
             echo "Scanner-adapter floating tags: not requested by this build."
@@ -2509,7 +2237,7 @@ jobs:
             mapfile -t tags < <(awk -F'|' -v i="$img" -v d="$digest" '$1 == i && $2 == d { print $3 }' /tmp/floating-plan.txt)
             args=(); for t in "${tags[@]}"; do args+=( -t "${img}:${t}" ); done
             echo "==> ${img}@${digest} <- ${tags[*]}"
-            # Retry: a transient Docker Hub PROTOCOL_ERROR/ETIMEDOUT is what
+            # Retry: a transient registry PROTOCOL_ERROR/ETIMEDOUT is what
             # leaves a release half-tagged, and re-pointing to the SAME digest
             # makes every attempt a safe no-op-or-complete.
             n=0; max=5
@@ -2687,7 +2415,7 @@ jobs:
     needs: [merge-backend, merge-openscap, merge-scanner-adapter, apply-floating-tags]
     # always() would otherwise run this even when the fork guard on
     # publish-preflight skipped everything else; mirror that guard here.
-    if: ${{ always() && (github.event_name != 'schedule' || github.repository == 'artifact-keeper/artifact-keeper') }}
+    if: ${{ always() && (github.event_name != 'schedule' || github.repository == 'ProVerseAI/artifact-keeper') }}
     steps:
       # Names the images this run publishes, NOT `:latest` for each of them --
       # which is what it used to print unconditionally, on every branch build
@@ -2699,20 +2427,20 @@ jobs:
         run: |
           echo "## Docker Images Published" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Image | ghcr.io | Docker Hub |" >> $GITHUB_STEP_SUMMARY
-          echo "|---|---|---|" >> $GITHUB_STEP_SUMMARY
-          echo "| Backend | \`${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}\` | \`docker.io/${{ env.DOCKERHUB_BACKEND }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| OpenSCAP | \`${{ env.REGISTRY }}/${{ env.OPENSCAP_IMAGE }}\` | \`docker.io/${{ env.DOCKERHUB_OPENSCAP }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| Scanner Adapter | \`${{ env.REGISTRY }}/${{ env.SCANNER_ADAPTER_IMAGE }}\` | \`docker.io/${{ env.DOCKERHUB_SCANNER_ADAPTER }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Image | ghcr.io |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| Backend | \`${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| OpenSCAP | \`${{ env.REGISTRY }}/${{ env.OPENSCAP_IMAGE }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Scanner Adapter | \`${{ env.REGISTRY }}/${{ env.SCANNER_ADAPTER_IMAGE }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "See the **Apply Floating Tags** job for which floating tags (if any) moved." >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Supply Chain Security" >> $GITHUB_STEP_SUMMARY
           echo "- All images signed with [cosign](https://docs.sigstore.dev/cosign/overview/) keyless signing (GitHub OIDC), and each merge job re-checks that the tags it published resolve to signed bytes (#3559)" >> $GITHUB_STEP_SUMMARY
           # The identity pattern below is pinned to the workflow that is
-          # allowed to sign. The previous hint said `https://github.com/artifact-keeper/.*`,
-          # which accepts a signature from ANY workflow in the org — including
+          # allowed to sign. A hint of the shape `https://github.com/<org>/.*`
+          # would accept a signature from ANY workflow in the org — including
           # one a contributor could add in a fork-triggered run. An identity
           # pattern is half the assertion; a loose one gives a green verify
           # that means very little.
-          echo "- Verify: \`cosign verify --certificate-oidc-issuer=https://token.actions.githubusercontent.com --certificate-identity-regexp='^https://github[.]com/artifact-keeper/artifact-keeper/[.]github/workflows/docker-publish[.]yml@refs/tags/v.+$' ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}:<version>\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Verify: \`cosign verify --certificate-oidc-issuer=https://token.actions.githubusercontent.com --certificate-identity-regexp='^https://github[.]com/ProVerseAI/artifact-keeper/[.]github/workflows/docker-publish[.]yml@refs/tags/v.+$' ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}:<version>\`" >> $GITHUB_STEP_SUMMARY

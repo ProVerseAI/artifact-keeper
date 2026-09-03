@@ -4,15 +4,21 @@
 #
 # THE INVARIANT
 # -------------
-#   EVERY REGISTRY A PUBLISH JOB MIRRORS AN IMAGE TO IS ALSO A REGISTRY IT
+#   EVERY REGISTRY A PUBLISH JOB PUSHES AN IMAGE TO IS ALSO A REGISTRY IT
 #   SIGNS THAT IMAGE ON, AND VERIFIES THE PUBLISHED TAGS ON.
 #
 # This is the same statement #3559 makes about a single registry -- the bytes a
-# user pulls by tag are the bytes that were signed -- carried across the fact
-# that this project ships the identical bytes through TWO distribution
-# channels. A consumer pulling `docker.io/artifactkeeper/backend:1.8.1` and a
-# consumer pulling `ghcr.io/artifact-keeper/artifact-keeper-backend:1.8.1` get
-# byte-identical images; only one of them could verify what they got.
+# user pulls by tag are the bytes that were signed -- asked once per
+# distribution channel. Upstream shipped identical bytes through two channels
+# (ghcr.io and docker.io/artifactkeeper) and could only verify one of them.
+#
+# This fork publishes to ghcr.io alone: the Docker Hub mirror is gone, so the
+# invariant is currently satisfied by a single registry. The gate is phrased
+# over "the registries this job actually pushes to" rather than over a
+# hardcoded pair, so it keeps its teeth in both directions -- it stays green
+# on a one-registry publish, and it turns red on the pull request that adds a
+# second registry without signing and verifying there too, which is exactly
+# how #3562 came about the first time.
 #
 # WHY A STATIC GATE, WHEN THE RUNTIME GATE ALREADY EXISTS
 # -------------------------------------------------------
@@ -26,18 +32,17 @@
 #
 # So this gate reads the workflow rather than the registry, and asks the one
 # question the runtime gate structurally cannot: does the list of registries
-# this job PUSHES to equal the list it SIGNS and VERIFIES? Deleting the Docker
-# Hub half of either step turns this red on the PR that does it, without
-# waiting for a publish.
+# this job PUSHES to equal the list it SIGNS and VERIFIES? Dropping either
+# half turns this red on the PR that does it, without waiting for a publish.
 #
 # WHAT IS AND IS NOT IN SCOPE
-#   * A job is IN SCOPE when it signs with cosign AND mirrors an image to
-#     Docker Hub. Those are the jobs that publish new bytes.
+#   * A job is IN SCOPE when it signs with cosign AND pushes an image to at
+#     least one registry. Those are the jobs that publish new bytes.
 #   * `apply-floating-tags` is deliberately out of scope: it writes no new
 #     bytes, only re-points tags at a digest the merge jobs already published
-#     and signed on both registries. `imagetools create` uploads no layers and
-#     produces no new manifest, so the signature keeps covering it -- which is
-#     also why the Docker Hub signature must be made over the DIGEST.
+#     and signed. `imagetools create` uploads no layers and produces no new
+#     manifest, so the signature keeps covering it -- which is also why the
+#     signature must be made over the DIGEST.
 #   * A job disabled with a literal `if: false` is skipped, because it
 #     publishes nothing. `merge-backend-alpine` is in that state today (Alpine
 #     builds suspended). Re-enabling it changes that `if:`, and this gate fires
@@ -89,11 +94,17 @@ MIN_SIGNING_JOBS = 3
 
 # Text that identifies a reference to each registry, in a `run:` body or in a
 # step's `env:`. Deliberately broad -- the tag sets reach the steps through
-# several indirections (`/tmp/hub-tags.json`, `steps.meta-dockerhub.outputs`,
-# `${DOCKERHUB_*}`) and a narrow literal match would be defeated by any of
-# them.
-GHCR_MARKERS = (r"ghcr\.io", r"env\.REGISTRY", r"\$\{REGISTRY\}", r"ghcr-tags")
-HUB_MARKERS = (r"docker\.io/", r"hub-tags", r"meta-dockerhub", r"DOCKERHUB_")
+# several indirections (`/tmp/ghcr-tags.json`, `steps.meta*.outputs`,
+# `${REGISTRY}`) and a narrow literal match would be defeated by any of them.
+#
+# Every registry this workflow could publish to is named here, including the
+# Docker Hub one this fork no longer mirrors to: the gate's question is "which
+# of these does the job push to, and does it sign and verify each of those",
+# so a re-added mirror is picked up without editing this list.
+REGISTRIES = {
+    "ghcr.io": (r"ghcr\.io", r"env\.REGISTRY", r"\$\{REGISTRY\}", r"ghcr-tags"),
+    "Docker Hub": (r"docker\.io/", r"hub-tags", r"meta-dockerhub", r"DOCKERHUB_"),
+}
 
 MIRROR_MARKER = "imagetools create"
 COSIGN_SIGN = "cosign sign"
@@ -148,11 +159,14 @@ for job_name, job in doc["jobs"].items():
     texts = [(s, step_text(s)) for s in steps]
 
     signs = [t for _, t in texts if COSIGN_SIGN in t]
-    mirrors_hub = [
-        t for _, t in texts if MIRROR_MARKER in t and has(t, HUB_MARKERS)
-    ]
+    pushes = [t for _, t in texts if MIRROR_MARKER in t]
+    pushed_to = sorted(
+        name
+        for name, markers in REGISTRIES.items()
+        if any(has(t, markers) for t in pushes)
+    )
 
-    if not signs or not mirrors_hub:
+    if not signs or not pushed_to:
         continue
 
     if disabled(job):
@@ -160,29 +174,26 @@ for job_name, job in doc["jobs"].items():
         continue
 
     in_scope.append(job_name)
-
-    # (a) Signing parity. The job pushes the image to Docker Hub, so a cosign
-    #     signature must be made on the docker.io reference too -- a signature
-    #     is scoped to the repository it was pushed to, so the ghcr one says
-    #     nothing to anyone pulling from Docker Hub.
-    if not any(has(t, HUB_MARKERS) for t in signs):
-        violations.append(
-            f"{basename} :: {job_name}\n"
-            f"    mirrors an image to Docker Hub but its `cosign sign` step(s) reference\n"
-            f"    only ghcr. A cosign signature lives in the repository it was pushed to,\n"
-            f"    so signing the ghcr ref leaves every docker.io tag unverifiable even\n"
-            f"    though the bytes are identical (#3562). Sign the docker.io digest too."
-        )
-    if not any(has(t, GHCR_MARKERS) for t in signs):
-        violations.append(
-            f"{basename} :: {job_name}\n"
-            f"    signs a Docker Hub reference but no ghcr one. Parity runs both ways:\n"
-            f"    every registry this job publishes to must be signed."
-        )
-
-    # (b) Verification parity. A gate pointed at one of two registries leaves
-    #     exactly the hole #3562 records, and leaves it invisible.
     verifies = [t for _, t in texts if VERIFY_SCRIPT in t]
+
+    # (a) Signing parity. A cosign signature lives in the repository it was
+    #     pushed to, so a signature on one registry says nothing to anyone
+    #     pulling from another. Every registry this job pushed to must be
+    #     signed (#3562).
+    for registry in pushed_to:
+        markers = REGISTRIES[registry]
+        if not any(has(t, markers) for t in signs):
+            violations.append(
+                f"{basename} :: {job_name}\n"
+                f"    pushes an image to {registry} but no `cosign sign` step references it.\n"
+                f"    A cosign signature lives in the repository it was pushed to, so signing\n"
+                f"    one registry leaves every tag on the other unverifiable even though the\n"
+                f"    bytes are identical (#3562). Sign the {registry} digest too."
+            )
+
+    # (b) Verification parity. A gate pointed at some of the registries a job
+    #     publishes to leaves exactly the hole #3562 records, and leaves it
+    #     invisible.
     if not verifies:
         violations.append(
             f"{basename} :: {job_name}\n"
@@ -191,19 +202,17 @@ for job_name, job in doc["jobs"].items():
             f"    signature reached the published tag (#3559)."
         )
     else:
-        if not any(has(t, HUB_MARKERS) for t in verifies):
-            violations.append(
-                f"{basename} :: {job_name}\n"
-                f"    verifies published tags on ghcr only. The Docker Hub tags this job\n"
-                f"    wrote are exactly the ones that shipped unsigned for the whole life of\n"
-                f"    the project (#3562); a gate that checks one of two registries would\n"
-                f"    have stayed green through all of it. Pass the Docker Hub tag set too."
-            )
-        if not any(has(t, GHCR_MARKERS) for t in verifies):
-            violations.append(
-                f"{basename} :: {job_name}\n"
-                f"    verifies published tags on Docker Hub only, not on ghcr."
-            )
+        for registry in pushed_to:
+            markers = REGISTRIES[registry]
+            if not any(has(t, markers) for t in verifies):
+                violations.append(
+                    f"{basename} :: {job_name}\n"
+                    f"    pushes to {registry} but never verifies the tags it wrote there. The\n"
+                    f"    Docker Hub tags upstream wrote are exactly the ones that shipped\n"
+                    f"    unsigned for the whole life of the project (#3562); a gate that checks\n"
+                    f"    some of the registries a job publishes to would have stayed green\n"
+                    f"    through all of it. Pass the {registry} tag set too."
+                )
 
 if skipped_disabled:
     print(
@@ -228,7 +237,7 @@ if violations:
 if len(in_scope) < MIN_SIGNING_JOBS:
     print(
         f"ERROR: found only {len(in_scope)} job(s) in {basename} that sign an image and\n"
-        f"mirror it to Docker Hub; expected at least {MIN_SIGNING_JOBS}\n"
+        f"push it to a registry; expected at least {MIN_SIGNING_JOBS}\n"
         f"(merge-backend, merge-openscap, merge-scanner-adapter).\n\n"
         "This gate's scope is defined by the presence of a cosign signing step, so\n"
         "deleting one would otherwise silently remove a job from its own guard --\n"
