@@ -573,6 +573,31 @@ pub fn parse_metadata_versions(xml: &str) -> Option<(String, String, Vec<String>
 /// metadata to derive a *stable* aggregate timestamp, so the generated body is
 /// byte-reproducible across the separate `maven-metadata.xml` and
 /// `maven-metadata.xml.sha1` requests (#1922).
+/// Point a stored artifact-level `maven-metadata.xml`'s `<latest>` at the
+/// highest version its own `<versions>` list holds.
+///
+/// Maven's deploy merge only advances `<latest>` for `maven-plugin`
+/// packaging, so a document seeded with `latest=1.0.0` keeps saying so after
+/// every later deploy has appended its version, and a hosted repository that
+/// serves the stored document verbatim reports a stale `latest` forever.
+/// `<release>` is maintained by the deploy merge and is left alone, as is
+/// everything else in the document.
+///
+/// Returns `None` when there is nothing to change: no `<versions>` list
+/// (plugin-prefix or snapshot-level metadata), no `<latest>` element, or a
+/// `<latest>` that is already the highest version. Stored data is never
+/// rewritten; this is applied to the bytes being served.
+pub fn normalize_metadata_latest(xml: &str) -> Option<String> {
+    let (_, _, versions) = parse_metadata_versions(xml)?;
+    let highest = super::maven_version::sort_maven_versions(&versions).pop()?;
+    let open = xml.find("<latest>")? + "<latest>".len();
+    let close = open + xml[open..].find("</latest>")?;
+    if xml[open..close].trim() == highest {
+        return None;
+    }
+    Some(format!("{}{}{}", &xml[..open], highest, &xml[close..]))
+}
+
 pub fn parse_metadata_last_updated(xml: &str) -> Option<String> {
     let ts = xml
         .split("<lastUpdated>")
@@ -1139,6 +1164,48 @@ mod tests {
             parse_metadata_last_updated("<lastUpdated>  </lastUpdated>"),
             None
         );
+    }
+
+    /// The live case: a deploy-merged document whose `<latest>` was seeded at
+    /// 1.0.0 and never advanced. Only the `<latest>` text changes.
+    #[test]
+    fn test_normalize_metadata_latest_advances_stale_latest() {
+        let stale = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<metadata>\n  \
+            <groupId>tech.proverse</groupId>\n  <artifactId>comm</artifactId>\n  \
+            <versioning>\n    <latest>1.0.0</latest>\n    <release>4.6.0</release>\n    \
+            <versions>\n      <version>1.0.0</version>\n      <version>4.10.0</version>\n      \
+            <version>4.6.0</version>\n    </versions>\n    \
+            <lastUpdated>20261101120000</lastUpdated>\n  </versioning>\n</metadata>\n";
+        let fixed = normalize_metadata_latest(stale).expect("stale latest is rewritten");
+        assert_eq!(
+            fixed,
+            stale.replace("<latest>1.0.0</latest>", "<latest>4.10.0</latest>")
+        );
+        // Idempotent: the served form needs no further change.
+        assert_eq!(normalize_metadata_latest(&fixed), None);
+    }
+
+    #[test]
+    fn test_normalize_metadata_latest_leaves_other_documents_alone() {
+        // Already correct, as the generator writes it.
+        let current = generate_metadata_xml(
+            "com.example",
+            "my-lib",
+            &["1.0.0".into(), "1.1.0".into()],
+            "1.1.0",
+            Some("1.1.0"),
+            "20260704133248",
+        );
+        assert_eq!(normalize_metadata_latest(&current), None);
+        // No `<latest>` element: nothing to point anywhere.
+        let no_latest = "<metadata><groupId>g</groupId><artifactId>a</artifactId>\
+            <versioning><versions><version>1.0</version><version>2.0</version>\
+            </versions></versioning></metadata>";
+        assert_eq!(normalize_metadata_latest(no_latest), None);
+        // Group-level plugin-prefix metadata has no `<versions>`.
+        let plugins = "<metadata><plugins><plugin><prefix>x</prefix>\
+            <artifactId>x-maven-plugin</artifactId></plugin></plugins></metadata>";
+        assert_eq!(normalize_metadata_latest(plugins), None);
     }
 
     const PLUGIN_PREFIX_DOC_A: &str = r#"<?xml version="1.0" encoding="UTF-8"?>

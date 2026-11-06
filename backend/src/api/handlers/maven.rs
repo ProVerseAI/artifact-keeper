@@ -2076,6 +2076,17 @@ async fn read_member_stored_metadata(
     None
 }
 
+/// A stored `maven-metadata.xml` as served: `<latest>` points at the highest
+/// listed version (see [`crate::formats::maven::normalize_metadata_latest`]).
+/// The checksum sidecars hash these served bytes, so they stay consistent.
+fn normalize_stored_metadata(content: Bytes) -> Bytes {
+    std::str::from_utf8(&content)
+        .ok()
+        .and_then(crate::formats::maven::normalize_metadata_latest)
+        .map(Bytes::from)
+        .unwrap_or(content)
+}
+
 async fn fetch_maven_metadata_bytes(
     state: &SharedState,
     repo: &RepoInfo,
@@ -2336,7 +2347,7 @@ async fn fetch_maven_metadata_bytes(
         path,
     ) {
         if let Ok(content) = storage.get(&scoped_key).await {
-            return Ok(content);
+            return Ok(normalize_stored_metadata(content));
         }
     }
     let meta_storage_key = format!("maven/{}", path);
@@ -2349,7 +2360,7 @@ async fn fetch_maven_metadata_bytes(
     .await
     {
         if let Ok(content) = storage.get(&meta_storage_key).await {
-            return Ok(content);
+            return Ok(normalize_stored_metadata(content));
         }
     }
 
@@ -9884,6 +9895,63 @@ mod tests {
             compute_checksum(&sha256_body, ChecksumType::Sha256),
             "local .sha256 must equal sha256 of the served metadata body (#1922)"
         );
+    }
+
+    /// LOCAL repo serving a STORED deploy-merged `maven-metadata.xml` whose
+    /// `<latest>` was seeded at the first version and never advanced: the
+    /// served document points `<latest>` at the highest listed version, the
+    /// stored object is left untouched, and the `.sha1` hashes the served
+    /// bytes (TASK-006).
+    #[tokio::test]
+    async fn test_local_stored_metadata_serves_highest_version_as_latest() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, repo_key, dir) = tdh::create_repo(&pool, "local", "maven").await;
+        let (user_id, username) = tdh::create_user(&pool).await;
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+        let state = tdh::build_state(pool.clone(), dir.to_str().unwrap());
+        let auth = tdh::make_auth(user_id, &username);
+
+        let meta_path = "tech/proverse/task006-comm/maven-metadata.xml";
+        let stored = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<metadata>\n  \
+            <groupId>tech.proverse</groupId>\n  <artifactId>task006-comm</artifactId>\n  \
+            <versioning>\n    <latest>1.0.0</latest>\n    <release>4.6.0</release>\n    \
+            <versions>\n      <version>1.0.0</version>\n      <version>4.6.0</version>\n    \
+            </versions>\n    <lastUpdated>20261101120000</lastUpdated>\n  </versioning>\n\
+            </metadata>\n";
+        let storage = state
+            .storage_for_repo(&crate::storage::StorageLocation {
+                backend: "filesystem".to_string(),
+                path: dir.to_string_lossy().into_owned(),
+            })
+            .expect("storage");
+        let key = format!("maven/{meta_path}");
+        storage
+            .put(&key, bytes::Bytes::from_static(stored.as_bytes()))
+            .await
+            .expect("store metadata");
+
+        let (body, sha1) =
+            served_metadata_and_checksum(&state, &auth, &repo_key, meta_path, "sha1").await;
+        let still_stored = storage.get(&key).await.expect("stored metadata");
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            String::from_utf8_lossy(&body),
+            stored.replace("<latest>1.0.0</latest>", "<latest>4.6.0</latest>"),
+            "only <latest> changes in the served document"
+        );
+        assert_eq!(
+            &still_stored[..],
+            stored.as_bytes(),
+            "stored data is not rewritten"
+        );
+        assert_eq!(sha1, compute_checksum(&body, ChecksumType::Sha1));
     }
 
     /// VIRTUAL repo over two LOCAL members: the served checksum must match the
