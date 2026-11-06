@@ -42362,6 +42362,289 @@ mod oci_read_authz_tests {
              still enumerate BOTH members' tags; got {read_tags:?}"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // TASK-006 acceptance: per-repository `/v2` read confinement on the
+    // credential paths production pull clients actually use.
+    //
+    // Observed on the labs deployment (built from upstream 95b161c4, which
+    // predates #3261): a user whose ONLY docker grant was a GROUP read on one
+    // repository listed tags of a second, private repository with Basic
+    // `username:password`, and a raw API token restricted to one repository
+    // (BUG-020) read every repository its owner could. Both shapes are pinned
+    // here on every read verb, with positive controls on the granted
+    // repository so a gate that denied everything could not pass.
+    // -----------------------------------------------------------------------
+
+    /// A second private docker repository holding the same image layout as
+    /// the fixture's, for the caller to be legitimately granted on.
+    struct GrantedRepo {
+        id: Uuid,
+        key: String,
+        dir: std::path::PathBuf,
+        blob_digest: String,
+    }
+
+    impl GrantedRepo {
+        async fn create(f: &ReadFixture) -> Self {
+            let (id, key, dir) = tdh::create_repo(&f.pool, "local", "docker").await;
+            let storage = f
+                .state
+                .storage_for_repo(&crate::storage::StorageLocation {
+                    backend: "filesystem".to_string(),
+                    path: dir.to_string_lossy().into_owned(),
+                })
+                .expect("storage");
+            let blob_digest = seed_image(
+                &f.pool,
+                &storage,
+                id,
+                TAG,
+                MANIFEST_BODY,
+                b"task-006 granted layer",
+            )
+            .await;
+            Self {
+                id,
+                key,
+                dir,
+                blob_digest,
+            }
+        }
+
+        fn paths(&self) -> [String; 3] {
+            [
+                format!("/{}/{}/manifests/{}", self.key, IMAGE, TAG),
+                format!("/{}/{}/blobs/{}", self.key, IMAGE, self.blob_digest),
+                format!("/{}/{}/tags/list", self.key, IMAGE),
+            ]
+        }
+
+        async fn drop_all(&self, pool: &PgPool) {
+            for sql in [
+                "DELETE FROM oci_tags WHERE repository_id = $1",
+                "DELETE FROM oci_blobs WHERE repository_id = $1",
+                "DELETE FROM permissions WHERE target_id = $1",
+                "DELETE FROM api_token_repositories WHERE repo_id = $1",
+            ] {
+                let _ = sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(self.id)
+                    .execute(pool)
+                    .await;
+            }
+            tdh::cleanup_member_repo(pool, self.id, &self.dir).await;
+        }
+    }
+
+    impl ReadFixture {
+        /// The fixture repository's read verbs, which the callers below hold
+        /// NO grant on (or whose token excludes it).
+        fn denied_paths(&self) -> [String; 3] {
+            [self.manifest_path(), self.blob_path(), self.tags_path()]
+        }
+
+        /// A non-admin user with a real bcrypt password, so the Basic
+        /// `username:password` branch of `authenticate_oci_with_scopes` runs.
+        async fn add_password_user(&mut self) -> (Uuid, String, String) {
+            let id = new_user(&self.pool, false).await;
+            self.extra_users.push(id);
+            let password = "task006-pass".to_string();
+            let hash = bcrypt::hash(&password, 4).expect("bcrypt hash");
+            let username: String = sqlx::query_scalar(
+                "UPDATE users SET password_hash = $2 WHERE id = $1 RETURNING username",
+            )
+            .bind(id)
+            .bind(&hash)
+            .fetch_one(&self.pool)
+            .await
+            .expect("set password");
+            (id, username, password)
+        }
+
+        /// Exchange `authorization` at `/v2/token` and return the minted
+        /// bearer, so the JWT path is held to the same confinement.
+        async fn exchange(&self, authorization: &str, repo_key: &str) -> String {
+            let (status, body) = self
+                .call(
+                    "GET",
+                    format!("/token?scope=repository:{repo_key}/{IMAGE}:pull"),
+                    authorization,
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK, "token exchange: {body:?}");
+            let json: serde_json::Value = serde_json::from_slice(&body).expect("token json");
+            format!("Bearer {}", json["token"].as_str().expect("token field"))
+        }
+
+        /// Assert every read verb is served on `granted` and refused, with no
+        /// content, on the fixture repository, plus the `_catalog` listing.
+        async fn assert_confined(&self, granted: &GrantedRepo, authorization: &str, what: &str) {
+            for path in granted.paths() {
+                let (status, _) = self.call("GET", path.clone(), authorization).await;
+                assert_eq!(status, StatusCode::OK, "{what}: granted read {path}");
+            }
+            // `tags/list` has no HEAD route (405 for every caller), so HEAD
+            // is asserted on the manifest and blob verbs only.
+            let [manifest, blob, tags] = self.denied_paths();
+            let probes = [
+                ("GET", manifest.clone()),
+                ("GET", blob.clone()),
+                ("GET", tags),
+                ("HEAD", manifest),
+                ("HEAD", blob),
+            ];
+            for (method, path) in probes {
+                let (status, body) = self.call(method, path.clone(), authorization).await;
+                assert!(
+                    matches!(
+                        status,
+                        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::NOT_FOUND
+                    ),
+                    "{what}: {method} {path} on an ungranted private repository \
+                     must be 401/403/404, got {status}"
+                );
+                let text = String::from_utf8_lossy(&body);
+                assert!(
+                    !text.contains(MANIFEST_MARKER)
+                        && !text.contains("private layer bytes")
+                        && !text.contains(&format!("\"{TAG}\"")),
+                    "{what}: {method} {path} leaked content: {text}"
+                );
+            }
+            let (status, body) = self
+                .call("GET", "/_catalog".to_string(), authorization)
+                .await;
+            let text = String::from_utf8_lossy(&body);
+            assert_eq!(status, StatusCode::OK, "{what}: _catalog");
+            assert!(
+                text.contains(&granted.key) && !text.contains(&self.repo_key),
+                "{what}: _catalog must list the granted repository only: {text}"
+            );
+        }
+    }
+
+    /// The live report, exactly: group read on repository A, Basic
+    /// `username:password`, reads of private repository B. Also through the
+    /// `/v2/token` JWT the same credential mints.
+    #[tokio::test]
+    async fn task006_group_read_grant_confines_basic_password_reads() {
+        let Some(mut f) = ReadFixture::setup().await else {
+            return;
+        };
+        let granted = GrantedRepo::create(&f).await;
+        let (user_id, username, password) = f.add_password_user().await;
+        let (group_id, _) = tdh::create_group(&f.pool).await;
+        sqlx::query("INSERT INTO user_group_members (user_id, group_id) VALUES ($1, $2)")
+            .bind(user_id)
+            .bind(group_id)
+            .execute(&f.pool)
+            .await
+            .expect("join group");
+        tdh::grant_permission(
+            &f.pool,
+            "group",
+            group_id,
+            "repository",
+            granted.id,
+            &["read"],
+        )
+        .await;
+
+        let basic = tdh::basic_auth(&username, &password);
+        let result = async {
+            f.assert_confined(&granted, &basic, "Basic user:password")
+                .await;
+            let jwt = f.exchange(&basic, &f.repo_key).await;
+            f.assert_confined(&granted, &jwt, "/v2/token JWT from Basic password")
+                .await;
+        };
+        let outcome = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(result)).await;
+
+        granted.drop_all(&f.pool).await;
+        let _ = sqlx::query("DELETE FROM groups WHERE id = $1")
+            .bind(group_id)
+            .execute(&f.pool)
+            .await;
+        f.teardown().await;
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    /// BUG-020: an API token whose owner may read BOTH repositories but whose
+    /// allow-list names only A must not read B — presented as the Basic
+    /// password, as a raw Bearer, and as the JWT `/v2/token` mints from it.
+    /// Both allow-list sources are covered: `api_token_repositories` rows and
+    /// a `repo_selector`.
+    #[tokio::test]
+    async fn task006_api_token_allow_list_confines_raw_token_reads() {
+        let Some(mut f) = ReadFixture::setup().await else {
+            return;
+        };
+        let granted = GrantedRepo::create(&f).await;
+        let (user_id, username, _) = f.add_password_user().await;
+        for repo_id in [granted.id, f.repo_id] {
+            tdh::grant_permission(&f.pool, "user", user_id, "repository", repo_id, &["read"]).await;
+        }
+        let auth_service = crate::services::auth_service::AuthService::new(
+            f.pool.clone(),
+            std::sync::Arc::new(f.state.config.clone()),
+        );
+        let mint = |name: &'static str| {
+            let auth_service = &auth_service;
+            async move {
+                auth_service
+                    .generate_api_token(user_id, name, vec!["read:artifacts".to_string()], None)
+                    .await
+                    .expect("mint api token")
+            }
+        };
+        let (listed_token, listed_id) = mint("task006-listed").await;
+        sqlx::query("INSERT INTO api_token_repositories (token_id, repo_id) VALUES ($1, $2)")
+            .bind(listed_id)
+            .bind(granted.id)
+            .execute(&f.pool)
+            .await
+            .expect("token allow-list row");
+        let (selector_token, selector_id) = mint("task006-selector").await;
+        sqlx::query("UPDATE api_tokens SET repo_selector = $2 WHERE id = $1")
+            .bind(selector_id)
+            .bind(serde_json::json!({
+                "match_formats": ["docker"],
+                "match_pattern": granted.key,
+            }))
+            .execute(&f.pool)
+            .await
+            .expect("token repo_selector");
+
+        let result = async {
+            for (token, source) in [
+                (&listed_token, "api_token_repositories"),
+                (&selector_token, "repo_selector"),
+            ] {
+                let basic = tdh::basic_auth(&username, token);
+                f.assert_confined(&granted, &basic, &format!("Basic user:TOKEN ({source})"))
+                    .await;
+                let raw = format!("Bearer {token}");
+                f.assert_confined(&granted, &raw, &format!("raw Bearer TOKEN ({source})"))
+                    .await;
+                let jwt = f.exchange(&basic, &granted.key).await;
+                f.assert_confined(&granted, &jwt, &format!("/v2/token JWT ({source})"))
+                    .await;
+            }
+        };
+        let outcome = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(result)).await;
+
+        let _ = sqlx::query("DELETE FROM permissions WHERE principal_id = $1")
+            .bind(user_id)
+            .execute(&f.pool)
+            .await;
+        granted.drop_all(&f.pool).await;
+        f.teardown().await;
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
