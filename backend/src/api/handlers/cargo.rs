@@ -2903,9 +2903,7 @@ fn extract_index_fields(
             arr.into_iter()
                 .map(|mut dep| {
                     if let serde_json::Value::Object(ref mut map) = dep {
-                        if let Some(vr) = map.remove("version_req") {
-                            map.entry("req").or_insert(vr);
-                        }
+                        normalize_index_dep(map);
                     }
                     dep
                 })
@@ -2926,6 +2924,39 @@ fn extract_index_fields(
             .cloned()
             .unwrap_or(serde_json::Value::Null),
     )
+}
+
+/// Rewrite one stored publish-API dependency into its sparse-index form.
+///
+/// The publish API and the index spell two things differently:
+///
+/// * the version requirement is `version_req` on publish and `req` in the
+///   index;
+/// * a renamed dependency (`alias = { package = "real-crate" }`) is published
+///   as `name = "real-crate"` plus `explicit_name_in_toml = "alias"`, but the
+///   index wants `name = "alias"` plus `package = "real-crate"`. Served in the
+///   publish form, every feature that names the alias (`srtp = ["alias/x"]`)
+///   points at a dependency the entry does not declare, and cargo rejects the
+///   whole entry as invalid (BUG-021).
+///
+/// Dependencies are stored exactly as published, so this runs on serve and
+/// heals rows written before it existed. It is idempotent: an entry already
+/// in index form (no `explicit_name_in_toml`, e.g. one rewritten by hand)
+/// comes out unchanged.
+fn normalize_index_dep(map: &mut serde_json::Map<String, serde_json::Value>) {
+    if let Some(vr) = map.remove("version_req") {
+        map.entry("req").or_insert(vr);
+    }
+    let alias = match map.remove("explicit_name_in_toml") {
+        Some(serde_json::Value::String(alias)) if !alias.is_empty() => alias,
+        _ => return,
+    };
+    if map.get("name").and_then(|n| n.as_str()) == Some(alias.as_str()) {
+        return;
+    }
+    if let Some(real) = map.insert("name".to_string(), serde_json::Value::String(alias)) {
+        map.entry("package").or_insert(real);
+    }
 }
 
 /// Build a JSON response with cache-control for index responses.
@@ -5344,6 +5375,70 @@ mod tests {
         assert_eq!(features, serde_json::json!({}));
         assert!(links.is_null());
         assert_eq!(rust_version, "1.56.0");
+    }
+
+    /// BUG-021: a renamed dependency as the publish API sends it
+    /// (`name` = real crate, `explicit_name_in_toml` = alias) is served in
+    /// the index form cargo requires (`name` = alias, `package` = real crate).
+    #[test]
+    fn test_extract_index_fields_renamed_dep_publish_form() {
+        let meta = serde_json::json!({
+            "deps": [
+                {"name": "openssl", "version_req": "^0.10",
+                 "explicit_name_in_toml": "openssl-crate", "optional": true},
+                {"name": "serde", "version_req": "^1", "explicit_name_in_toml": null}
+            ],
+            "features": {"srtp": ["openssl-crate/vendored"]}
+        });
+        let (deps, _, _, _) = extract_index_fields(Some(&meta));
+        assert_eq!(
+            deps,
+            serde_json::json!([
+                {"name": "openssl-crate", "package": "openssl", "req": "^0.10", "optional": true},
+                {"name": "serde", "req": "^1"}
+            ])
+        );
+    }
+
+    /// BUG-021: entries already in index form, including the rows that were
+    /// rewritten by hand in the database, come out byte-for-byte unchanged,
+    /// and a second pass over the healed form changes nothing either.
+    #[test]
+    fn test_extract_index_fields_renamed_dep_index_form_is_unchanged() {
+        let hand_fixed = serde_json::json!({
+            "deps": [
+                {"name": "openssl-crate", "package": "openssl", "req": "^0.10", "optional": true},
+                {"name": "log", "req": "^0.4"}
+            ]
+        });
+        let (deps, _, _, _) = extract_index_fields(Some(&hand_fixed));
+        assert_eq!(deps, hand_fixed["deps"]);
+
+        let published = serde_json::json!({
+            "deps": [{"name": "openssl", "version_req": "^0.10",
+                      "explicit_name_in_toml": "openssl-crate"}]
+        });
+        let (once, _, _, _) = extract_index_fields(Some(&published));
+        let (twice, _, _, _) = extract_index_fields(Some(&serde_json::json!({"deps": once})));
+        assert_eq!(once, twice);
+    }
+
+    /// BUG-021 through the full entry builder, which both the hosted index and
+    /// the virtual aggregation serve: the alias a feature references is a
+    /// declared dependency of the entry.
+    #[test]
+    fn test_build_index_entry_renamed_dep_matches_feature_reference() {
+        let meta = serde_json::json!({
+            "deps": [{"name": "openssl", "version_req": "^0.10",
+                      "explicit_name_in_toml": "openssl-crate", "optional": true}],
+            "features": {"srtp": ["openssl-crate/vendored"]}
+        });
+        let entry: serde_json::Value =
+            serde_json::from_str(&build_index_entry("webrtc", "4.6.2", "ck", Some(&meta))).unwrap();
+        assert_eq!(entry["deps"][0]["name"], "openssl-crate");
+        assert_eq!(entry["deps"][0]["package"], "openssl");
+        assert!(entry["deps"][0].get("explicit_name_in_toml").is_none());
+        assert_eq!(entry["cksum"], "ck");
     }
 
     // -----------------------------------------------------------------------
