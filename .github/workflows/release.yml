@@ -462,7 +462,7 @@ jobs:
                 # instead (#3640).
                 V="${GITHUB_REF_NAME#v}"
                 STATE=$(GHCR_TOKEN="${GH_TOKEN}" bash .github/scripts/registry-tag-state.sh \
-                  ghcr.io artifact-keeper/artifact-keeper-backend "${V}" 2>/dev/null || true)
+                  ghcr.io proverseai/artifact-keeper-backend "${V}" 2>/dev/null || true)
                 case "${STATE}" in
                   present)
                     echo "::error title=docker-publish failed (version already published)::Every docker-publish run for ${GITHUB_REF_NAME}@${GITHUB_SHA} completed without success -- and backend:${V} is ALREADY PUBLISHED, so a push-path rebuild will be refused by the immutability guard every time. Recovery: gh workflow run docker-publish.yml --ref ${GITHUB_REF_NAME} -f promote_version=${V} ; when it succeeds, re-run this workflow (the promote re-points tags at the published digest and the next job verifies its sources against this tag)."
@@ -549,7 +549,7 @@ jobs:
           echo ""
           echo "Polling ghcr backend:${VERSION} for its manifest-list digest"
           while true; do
-            BACKEND_DIGEST="$(resolve_ghcr_digest "artifact-keeper/artifact-keeper-backend" "${VERSION}" || true)"
+            BACKEND_DIGEST="$(resolve_ghcr_digest "proverseai/artifact-keeper-backend" "${VERSION}" || true)"
             if [ -n "${BACKEND_DIGEST}" ]; then
               echo "  ✓ backend:${VERSION} -> ${BACKEND_DIGEST}"
               break
@@ -571,7 +571,7 @@ jobs:
             echo ""
             echo "Confirming ghcr ${extra}:${VERSION} is present"
             while true; do
-              if [ -n "$(resolve_ghcr_digest "artifact-keeper/${extra}" "${VERSION}" || true)" ]; then
+              if [ -n "$(resolve_ghcr_digest "proverseai/${extra}" "${VERSION}" || true)" ]; then
                 echo "  ✓ ${extra}:${VERSION} present"
                 break
               fi
@@ -610,7 +610,7 @@ jobs:
             bad=1
           fi
           OPENSCAP_DIGEST="$(GHCR_TOKEN="${GHCR_TOKEN}" bash .github/scripts/registry-tag-digest.sh \
-            ghcr.io artifact-keeper/artifact-keeper-openscap "${VERSION}" 2>/dev/null || true)"
+            ghcr.io proverseai/artifact-keeper-openscap "${VERSION}" 2>/dev/null || true)"
           if [[ "${OPENSCAP_DIGEST}" != "${CERT_OPENSCAP}" ]]; then
             echo "::error title=Published openscap is not the certified openscap::openscap:${VERSION} resolves to ${OPENSCAP_DIGEST:-<unresolvable>} but the certification names ${CERT_OPENSCAP}."
             bad=1
@@ -636,7 +636,7 @@ jobs:
         run: |
           set -euo pipefail
           REV=$(GHCR_TOKEN="${GH_TOKEN}" bash .github/scripts/registry-tag-revision.sh \
-            ghcr.io artifact-keeper/artifact-keeper-backend "${VERSION}" || true)
+            ghcr.io proverseai/artifact-keeper-backend "${VERSION}" || true)
           echo "backend:${VERSION} reports source revision: ${REV}"
           rc=0
           ADOPT_TAG_SHA="${GITHUB_SHA}" \
@@ -985,33 +985,32 @@ jobs:
       - name: Verify CHANGELOG.md documents this release
         run: scripts/ci/assert-changelog-documents-version.sh "${GITHUB_REF#refs/tags/v}"
 
-      - name: Wait for and verify required images on ghcr.io and docker.io
+      - name: Wait for and verify required images on ghcr.io
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -u
           VERSION="${GITHUB_REF#refs/tags/v}"
           echo "Verifying required images for version: ${VERSION}"
-          echo "Both registries (ghcr.io and docker.io) must have every image."
+          echo "ghcr.io must have every image."
 
-          # Poll both registries for up to 30 minutes per image. Multi-arch
+          # Poll ghcr.io for up to 30 minutes per image. Multi-arch
           # builds, cosign signing and provenance attestation routinely take
           # 15-25 minutes, so we wait rather than fail-fast.
           DEADLINE=$(($(date +%s) + 30*60))
 
           # Required image set. Each entry is "<registry>|<name>:<tag>".
-          # ghcr.io uses the artifact-keeper org / hyphenated names.
-          # docker.io uses the artifactkeeper namespace / shorter names.
-          # Missing on EITHER registry blocks the release.
+          # ghcr.io is the only registry this fork publishes to; the upstream
+          # docker.io/artifactkeeper mirror was removed from docker-publish.yml,
+          # so requiring it here would block every release on an image nothing
+          # pushes any more.
           # The `-alpine` backend variant is currently suspended (its
           # build/merge jobs in docker-publish.yml are gated `if: false`), so
-          # it is intentionally omitted — re-add the two `${VERSION}-alpine`
-          # entries when that variant is published again.
+          # it is intentionally omitted — re-add the `${VERSION}-alpine`
+          # entry when that variant is published again.
           IMAGES=(
-            "ghcr.io|artifact-keeper/artifact-keeper-backend:${VERSION}"
-            "ghcr.io|artifact-keeper/artifact-keeper-openscap:${VERSION}"
-            "docker.io|artifactkeeper/backend:${VERSION}"
-            "docker.io|artifactkeeper/openscap:${VERSION}"
+            "ghcr.io|proverseai/artifact-keeper-backend:${VERSION}"
+            "ghcr.io|proverseai/artifact-keeper-openscap:${VERSION}"
           )
           # scanner-adapter has its own independent semver (see
           # docker/scanner-adapter/VERSION), so it is verified at ITS exact
@@ -1026,8 +1025,7 @@ jobs:
           case "${VERSION}" in
             *-*) echo "Prerelease ${VERSION}: scanner-adapter exact tag is not published for prereleases; skipped." ;;
             *)   IMAGES+=(
-                   "ghcr.io|artifact-keeper/artifact-keeper-scanner-adapter:${SCANNER_VERSION}"
-                   "docker.io|artifactkeeper/scanner-adapter:${SCANNER_VERSION}"
+                   "ghcr.io|proverseai/artifact-keeper-scanner-adapter:${SCANNER_VERSION}"
                  ) ;;
           esac
 
@@ -1052,28 +1050,11 @@ jobs:
               "https://ghcr.io/v2/${name}/manifests/${tag}"
           }
 
-          probe_dockerhub() {
-            local name="$1"; local tag="$2"
-            # Docker Hub anonymous token (works for public repos).
-            local token
-            token=$(curl -sf "https://auth.docker.io/token?service=registry.docker.io&scope=repository:${name}:pull" \
-              | jq -r '.token // empty')
-            [ -n "${token}" ] || return 1
-            # shellcheck disable=SC2086
-            # --proto =https refuses to follow HTTPS->HTTP redirects so the
-            # Bearer token can never leak over plaintext.
-            curl -sfL --proto =https -o /dev/null \
-              -H "Authorization: Bearer ${token}" \
-              ${MANIFEST_ACCEPT} \
-              "https://registry-1.docker.io/v2/${name}/manifests/${tag}"
-          }
-
           probe() {
             local registry="$1"; local img="$2"
             local name="${img%:*}"; local tag="${img#*:}"
             case "${registry}" in
               ghcr.io)   probe_ghcr "${name}" "${tag}" ;;
-              docker.io) probe_dockerhub "${name}" "${tag}" ;;
               *) echo "::error::unknown registry ${registry}"; return 2 ;;
             esac
           }
@@ -1101,12 +1082,12 @@ jobs:
 
           if [ "${#missing[@]}" -gt 0 ]; then
             echo ""
-            echo "::error::One or more required images are missing on ghcr.io and/or docker.io after the deadline. GitHub Release creation is blocked until every required image is published on both registries."
+            echo "::error::One or more required images are missing on ghcr.io after the deadline. GitHub Release creation is blocked until every required image is published."
             printf '  - %s\n' "${missing[@]}"
             exit 1
           fi
           echo ""
-          echo "All required images present on ghcr.io AND docker.io for version ${VERSION}."
+          echo "All required images present on ghcr.io for version ${VERSION}."
 
       # ── Candidate-digest tripwire (issue #2696) ─────────────────────────────
       # Re-resolve the published ghcr backend:${VERSION} digest and assert it
@@ -1124,7 +1105,7 @@ jobs:
         run: |
           set -euo pipefail
           VERSION="${GITHUB_REF#refs/tags/v}"
-          NAME="artifact-keeper/artifact-keeper-backend"
+          NAME="proverseai/artifact-keeper-backend"
           MANIFEST_ACCEPT='-H Accept:application/vnd.oci.image.index.v1+json -H Accept:application/vnd.docker.distribution.manifest.list.v2+json -H Accept:application/vnd.docker.distribution.manifest.v2+json'
 
           token=$(curl -sf "https://ghcr.io/token?service=ghcr.io&scope=repository:${NAME}:pull" \
@@ -1603,7 +1584,7 @@ jobs:
       # `verify-images-published` already asserts that for the exact tag; this
       # extends the same assertion to the tags most consumers actually pull.
       # A promotion that rebuilt instead of re-pointing would show up here as a
-      # different digest, on both registries.
+      # different digest.
       - name: Assert floating tags resolve to the gate-tested digest
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -1625,20 +1606,9 @@ jobs:
               | tr -d '\r' | awk 'tolower($1) == "docker-content-digest:" { d = $2 } END { print d }'
           }
 
-          hub_digest() {
-            local name="$1" tag="$2" token
-            token=$(curl -sf "https://auth.docker.io/token?service=registry.docker.io&scope=repository:${name}:pull" \
-              | jq -r '.token // empty')
-            [ -n "${token}" ] || return 1
-            # shellcheck disable=SC2086
-            curl -sI --proto =https -H "Authorization: Bearer ${token}" ${MANIFEST_ACCEPT} \
-              "https://registry-1.docker.io/v2/${name}/manifests/${tag}" \
-              | tr -d '\r' | awk 'tolower($1) == "docker-content-digest:" { d = $2 } END { print d }'
-          }
-
           # openscap is pinned by tag rather than digest, so its parity anchor
           # is its own published :${VERSION} rather than a gate-captured digest.
-          EXPECTED_OPENSCAP="$(ghcr_digest artifact-keeper/artifact-keeper-openscap "${VERSION}")"
+          EXPECTED_OPENSCAP="$(ghcr_digest proverseai/artifact-keeper-openscap "${VERSION}")"
           if [ -z "${EXPECTED_OPENSCAP}" ]; then
             echo "::error::could not resolve ghcr openscap:${VERSION}"; exit 1
           fi
@@ -1660,7 +1630,7 @@ jobs:
           if [ -z "${ADAPTER_VERSION}" ]; then
             echo "::error::could not read docker/scanner-adapter/VERSION at ${GITHUB_REF_NAME}"; exit 1
           fi
-          EXPECTED_ADAPTER="$(ghcr_digest artifact-keeper/artifact-keeper-scanner-adapter "${ADAPTER_VERSION}")"
+          EXPECTED_ADAPTER="$(ghcr_digest proverseai/artifact-keeper-scanner-adapter "${ADAPTER_VERSION}")"
           if [ -z "${EXPECTED_ADAPTER}" ]; then
             echo "::error::could not resolve ghcr scanner-adapter:${ADAPTER_VERSION}"; exit 1
           fi
@@ -1691,10 +1661,8 @@ jobs:
           }
 
           for tag in "latest" "${SERIES}"; do
-            assert "ghcr backend:${tag}"   "${EXPECTED_BACKEND}"  "$(ghcr_digest artifact-keeper/artifact-keeper-backend "${tag}")"
-            assert "hub  backend:${tag}"   "${EXPECTED_BACKEND}"  "$(hub_digest artifactkeeper/backend "${tag}")"
-            assert "ghcr openscap:${tag}"  "${EXPECTED_OPENSCAP}" "$(ghcr_digest artifact-keeper/artifact-keeper-openscap "${tag}")"
-            assert "hub  openscap:${tag}"  "${EXPECTED_OPENSCAP}" "$(hub_digest artifactkeeper/openscap "${tag}")"
+            assert "ghcr backend:${tag}"   "${EXPECTED_BACKEND}"  "$(ghcr_digest proverseai/artifact-keeper-backend "${tag}")"
+            assert "ghcr openscap:${tag}"  "${EXPECTED_OPENSCAP}" "$(ghcr_digest proverseai/artifact-keeper-openscap "${tag}")"
           done
           # A tag this version does not own must still EXIST (the #3775
           # shape was an absent `adapter:latest`); it legitimately names the
@@ -1709,11 +1677,9 @@ jobs:
           }
           for tag in "latest" "${ADAPTER_VERSION%.*}" "${ADAPTER_VERSION%%.*}"; do
             if adapter_owns "${tag}"; then
-              assert "ghcr scanner-adapter:${tag}" "${EXPECTED_ADAPTER}" "$(ghcr_digest artifact-keeper/artifact-keeper-scanner-adapter "${tag}")"
-              assert "hub  scanner-adapter:${tag}" "${EXPECTED_ADAPTER}" "$(hub_digest artifactkeeper/scanner-adapter "${tag}")"
+              assert "ghcr scanner-adapter:${tag}" "${EXPECTED_ADAPTER}" "$(ghcr_digest proverseai/artifact-keeper-scanner-adapter "${tag}")"
             else
-              present "ghcr scanner-adapter:${tag}" "$(ghcr_digest artifact-keeper/artifact-keeper-scanner-adapter "${tag}")"
-              present "hub  scanner-adapter:${tag}" "$(hub_digest artifactkeeper/scanner-adapter "${tag}")"
+              present "ghcr scanner-adapter:${tag}" "$(ghcr_digest proverseai/artifact-keeper-scanner-adapter "${tag}")"
             fi
           done
 

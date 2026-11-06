@@ -41,7 +41,8 @@ fail() { printf '  \033[31mFAIL\033[0m  %s\n' "$*"; fails=$((fails + 1)); }
 
 # job <name> <sign-targets> <verify-targets> [if-false]
 #   sign-targets / verify-targets: "both" | "ghcr" | "hub" | "none"
-# Every emitted job mirrors to Docker Hub, which is what puts it in scope.
+# Every emitted job pushes to both registries, so the parity question is asked
+#   about both. A job is in scope once it signs AND pushes anywhere.
 job() {
   local name="$1" sign="$2" verify="$3" iffalse="${4-}"
   printf '  %s:\n' "$name"
@@ -110,7 +111,7 @@ EOF
 # 2. THE #3562 FIXTURE. The workflow exactly as it was: mirrored to Docker Hub
 #    everywhere, signed on ghcr only. Green under every other check in this
 #    repository; must be red here.
-expect "signing ghcr only BLOCKS (the shipped defect)" 1 "mirrors an image to Docker Hub" <<EOF
+expect "signing ghcr only BLOCKS (the shipped defect)" 1 "pushes an image to Docker Hub" <<EOF
 $(job merge-backend ghcr ghcr)
 $(job merge-openscap ghcr ghcr)
 $(job merge-scanner-adapter ghcr ghcr)
@@ -119,20 +120,20 @@ EOF
 # 3. Signed on both, but the gate still only looks at ghcr. This is how the
 #    fix silently rots back: the signature is there today and nothing notices
 #    when a later change stops producing it.
-expect "verifying ghcr only BLOCKS" 1 "verifies published tags on ghcr only" <<EOF
+expect "verifying ghcr only BLOCKS" 1 "pushes to Docker Hub but never verifies" <<EOF
 $(job merge-backend both ghcr)
 $(job merge-openscap both both)
 $(job merge-scanner-adapter both both)
 EOF
 
 # 4. Parity runs both ways: dropping the ghcr signature is equally a defect.
-expect "signing Docker Hub only BLOCKS" 1 "no ghcr one" <<EOF
+expect "signing Docker Hub only BLOCKS" 1 "pushes an image to ghcr.io" <<EOF
 $(job merge-backend hub both)
 $(job merge-openscap both both)
 $(job merge-scanner-adapter both both)
 EOF
 
-expect "verifying Docker Hub only BLOCKS" 1 "not on ghcr" <<EOF
+expect "verifying Docker Hub only BLOCKS" 1 "pushes to ghcr.io but never verifies" <<EOF
 $(job merge-backend both hub)
 $(job merge-openscap both both)
 $(job merge-scanner-adapter both both)
